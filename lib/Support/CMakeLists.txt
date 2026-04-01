@@ -15,5 +15,6 @@ marco_add_runtime_shared_library(JITSupport
         JIT_LIB
         BuiltInFunctions.cpp
         Math.cpp
+        MemoryManagement.cpp
         Print.cpp
         UtilityFunctions.cpp)

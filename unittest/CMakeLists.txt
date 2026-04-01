@@ -12,4 +12,5 @@ marco_add_unittest(MARCORuntimeTest
 
 target_link_libraries(MARCORuntimeTest
     PUBLIC
-    Support)
+    Support
+    OptionsSimulation)

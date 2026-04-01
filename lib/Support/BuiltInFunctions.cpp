@@ -5,6 +5,10 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include "marco/Runtime/Support/MemoryManagement.h"
 
 //===----------------------------------------------------------------------===//
 // abs
@@ -75,6 +79,67 @@ void assert_void(bool condition, void *message, uint64_t level) {
 } // namespace
 
 RUNTIME_FUNC_DEF(assert, void, bool, PTR(void), uint64_t)
+
+//===----------------------------------------------------------------------===//
+// string_convert
+//===----------------------------------------------------------------------===//
+
+namespace {
+  template<typename T>
+  // 1. 泛型底层实现
+  void* string_convert_impl(T value) {
+    std::string str = std::to_string(value);
+    char* res = static_cast<char*>(marco_malloc(str.length() + 1));
+    std::strcpy(res, str.c_str());
+    return res;
+  }
+  // 2. 专门针对 bool 类型的特化实现
+  template<>
+  void* string_convert_impl<bool>(bool value) {
+    const char* str = value ? "true" : "false";
+    char* res = static_cast<char*>(marco_malloc(std::strlen(str) + 1));
+    std::strcpy(res, str);
+    return res;
+  }
+}
+
+// 必须命名为 string_convert_pvoid，因为 RUNTIME_FUNC_DEF 宏会寻找这个名字！
+// 补齐所有类型的重载，彻底堵死 C++ 隐式转换到 bool 的漏洞。
+void* string_convert_pvoid(bool v) { return string_convert_impl(v); }
+void* string_convert_pvoid(int32_t v) { return string_convert_impl(v); }
+void* string_convert_pvoid(int64_t v) { return string_convert_impl(v); }
+void* string_convert_pvoid(float v) { return string_convert_impl(v); }
+void* string_convert_pvoid(double v) { return string_convert_impl(v); }
+
+RUNTIME_FUNC_DEF(string_convert, PTR(void), bool)
+RUNTIME_FUNC_DEF(string_convert, PTR(void), int32_t)
+RUNTIME_FUNC_DEF(string_convert, PTR(void), int64_t)
+RUNTIME_FUNC_DEF(string_convert, PTR(void), float)
+RUNTIME_FUNC_DEF(string_convert, PTR(void), double)
+  
+  
+  //===----------------------------------------------------------------------===//
+  // string_concat
+  //===----------------------------------------------------------------------===//
+  
+  namespace {
+  void* string_concat_impl(void* lhs, void* rhs) {
+    const char* str_lhs = lhs ? static_cast<const char*>(lhs) : "";
+    const char* str_rhs = rhs ? static_cast<const char*>(rhs) : "";
+    
+    size_t len = std::strlen(str_lhs) + std::strlen(str_rhs) + 1;
+    char* res = static_cast<char*>(marco_malloc(len));
+    
+    std::strcpy(res, str_lhs);
+    std::strcat(res, str_rhs);
+    return res;
+  }
+}
+
+  // 同样为了防止宏展开找不到名称，覆盖可能出现的后缀
+  void* string_concat_pvoid(void* l, void* r) { return string_concat_impl(l, r); }
+
+  RUNTIME_FUNC_DEF(string_concat, PTR(void), PTR(void), PTR(void))
 
 //===----------------------------------------------------------------------===//
 // atan
@@ -1059,3 +1124,17 @@ RUNTIME_FUNC_DEF(zeros, void, ARRAY(int32_t))
 RUNTIME_FUNC_DEF(zeros, void, ARRAY(int64_t))
 RUNTIME_FUNC_DEF(zeros, void, ARRAY(float))
 RUNTIME_FUNC_DEF(zeros, void, ARRAY(double))
+
+//===----------------------------------------------------------------------===//
+// free
+//===----------------------------------------------------------------------===//
+
+// 暴露给宏的 C++ 函数
+void free_void(void* ptr) { 
+  if (ptr != nullptr) {
+      marco_free(ptr);
+  }
+}
+
+// 导出宏，使用小写的 void
+RUNTIME_FUNC_DEF(free, void, PTR(void))

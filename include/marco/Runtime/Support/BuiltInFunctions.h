@@ -18,6 +18,17 @@ RUNTIME_FUNC_DECL(asin, float, float)
 RUNTIME_FUNC_DECL(asin, double, double)
 
 RUNTIME_FUNC_DECL(assert, void, bool, PTR(void), uint64_t)
+// ----------------- 【新增：字符串转换与拼接声明】 -----------------
+RUNTIME_FUNC_DECL(string_convert, PTR(void), bool)
+RUNTIME_FUNC_DECL(string_convert, PTR(void), int32_t)
+RUNTIME_FUNC_DECL(string_convert, PTR(void), int64_t)
+RUNTIME_FUNC_DECL(string_convert, PTR(void), float)
+RUNTIME_FUNC_DECL(string_convert, PTR(void), double)
+
+RUNTIME_FUNC_DECL(string_concat, PTR(void), PTR(void), PTR(void))
+// 声明 free 函数，带有 extern "C" 链接性
+RUNTIME_FUNC_DECL(free, void, PTR(void))
+// -------------------------------------------------------------
 
 RUNTIME_FUNC_DECL(atan, float, float)
 RUNTIME_FUNC_DECL(atan, double, double)
