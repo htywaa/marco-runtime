@@ -5,40 +5,54 @@
 #include "marco/Runtime/Simulation/Profiler.h"
 #include "marco/Runtime/Simulation/Runtime.h"
 #include <cassert>
+#include <fstream>
 #include <iostream>
+#include <ostream>
 
 using namespace ::marco::runtime;
 using namespace ::marco::runtime::printing;
 
-static void printDerWrapOpening(int64_t order) {
+static void configureCSVStream(std::ostream &os) {
+  auto &options = printOptions();
+  os.precision(options.precision);
+
+  if (options.scientificNotation) {
+    os << std::scientific;
+  } else {
+    os << std::fixed;
+  }
+}
+
+static void printDerWrapOpening(std::ostream &os, int64_t order) {
   for (int64_t i = 0; i < order; ++i) {
     PRINT_PROFILER_STRING_START
-    std::cout << "der(";
+    os << "der(";
     PRINT_PROFILER_STRING_STOP
   }
 }
 
-static void printDerWrapClosing(int64_t order) {
+static void printDerWrapClosing(std::ostream &os, int64_t order) {
   for (int64_t i = 0; i < order; ++i) {
     PRINT_PROFILER_STRING_START
-    std::cout << ')';
+    os << ')';
     PRINT_PROFILER_STRING_STOP
   }
 }
 
-static void printName(char *name, int64_t rank, const int64_t *indices) {
+static void printName(std::ostream &os, char *name, int64_t rank,
+                      const int64_t *indices) {
   PRINT_PROFILER_STRING_START
-  std::cout << name;
+  os << name;
   PRINT_PROFILER_STRING_STOP
 
   if (rank != 0) {
     assert(indices != nullptr);
-    std::cout << '[';
+    os << '[';
 
     for (int64_t dim = 0; dim < rank; ++dim) {
       if (dim != 0) {
         PRINT_PROFILER_STRING_START
-        std::cout << ',';
+        os << ',';
         PRINT_PROFILER_STRING_STOP
       }
 
@@ -46,17 +60,17 @@ static void printName(char *name, int64_t rank, const int64_t *indices) {
       int64_t index = indices[dim] + 1;
 
       PRINT_PROFILER_INT_START
-      std::cout << index;
+      os << index;
       PRINT_PROFILER_INT_STOP
     }
 
-    std::cout << ']';
+    os << ']';
   }
 }
 
-static void printHeader(const Simulation &simulation) {
+static void printHeader(std::ostream &os, const Simulation &simulation) {
   PRINT_PROFILER_STRING_START
-  std::cout << '"' << "time" << '"';
+  os << '"' << "time" << '"';
   PRINT_PROFILER_STRING_STOP
 
   for (int64_t var : simulation.variablesPrintOrder) {
@@ -85,15 +99,15 @@ static void printHeader(const Simulation &simulation) {
     if (rank == 0) {
       // Print only the variable name.
       PRINT_PROFILER_STRING_START
-      std::cout << ',' << '"';
+      os << ',' << '"';
       PRINT_PROFILER_STRING_STOP
 
-      printDerWrapOpening(derOrder);
-      printName(name, 0, nullptr);
-      printDerWrapClosing(derOrder);
+      printDerWrapOpening(os, derOrder);
+      printName(os, name, 0, nullptr);
+      printDerWrapClosing(os, derOrder);
 
       PRINT_PROFILER_STRING_START
-      std::cout << '"';
+      os << '"';
       PRINT_PROFILER_STRING_STOP
     } else {
       // Print the name of the array and the indices, for each possible
@@ -105,15 +119,15 @@ static void printHeader(const Simulation &simulation) {
 
         for (auto it = beginIt; it != endIt; ++it) {
           PRINT_PROFILER_STRING_START
-          std::cout << ',' << '"';
+          os << ',' << '"';
           PRINT_PROFILER_STRING_STOP
 
-          printDerWrapOpening(derOrder);
-          printName(name, rank, *it);
-          printDerWrapClosing(derOrder);
+          printDerWrapOpening(os, derOrder);
+          printName(os, name, rank, *it);
+          printDerWrapClosing(os, derOrder);
 
           PRINT_PROFILER_STRING_START
-          std::cout << '"';
+          os << '"';
           PRINT_PROFILER_STRING_STOP
         }
       }
@@ -121,7 +135,28 @@ static void printHeader(const Simulation &simulation) {
   }
 
   PRINT_PROFILER_STRING_START
-  std::cout << std::endl;
+  os << std::endl;
+  PRINT_PROFILER_STRING_STOP
+}
+
+static void printValueLine(std::ostream &os, const double *values,
+                           uint64_t count) {
+  configureCSVStream(os);
+
+  for (uint64_t i = 0; i < count; ++i) {
+    PRINT_PROFILER_FLOAT_START
+    os << values[i];
+    PRINT_PROFILER_FLOAT_STOP
+
+    if (i + 1 != count) {
+      PRINT_PROFILER_STRING_START
+      os << ',';
+      PRINT_PROFILER_STRING_STOP
+    }
+  }
+
+  PRINT_PROFILER_STRING_START
+  os << std::endl;
   PRINT_PROFILER_STRING_STOP
 }
 
@@ -135,8 +170,15 @@ std::unique_ptr<cli::Category> CSVPrinter::getCLIOptions() {
 #endif // CLI_ENABLE
 
 void CSVPrinter::simulationBegin() {
+  openResultFile();
+
   SIMULATION_PROFILER_PRINTING_START
-  ::printHeader(*getSimulation());
+  ::printHeader(std::cout, *getSimulation());
+
+  if (resultFile.is_open()) {
+    ::printHeader(resultFile, *getSimulation());
+  }
+
   SIMULATION_PROFILER_PRINTING_STOP
 }
 
@@ -182,7 +224,35 @@ void CSVPrinter::printValues() {
   getBuffer().endLine();
 }
 
-void CSVPrinter::simulationEnd() { getBuffer().flush(); }
+void CSVPrinter::simulationEnd() {
+  getBuffer().flush();
+
+  if (resultFile.is_open()) {
+    resultFile.flush();
+  }
+}
+
+void CSVPrinter::openResultFile() {
+  if (resultFile.is_open()) {
+    return;
+  }
+
+  std::string path = printOptions().resultFile;
+
+  if (path.empty()) {
+    // 中文：默认写入 OMC 风格的结果文件，同时保持现有 stdout 输出不变。
+    // English: By default, write an OMC-style result file while preserving the
+    // existing stdout stream unchanged.
+    path = std::string(getModelName()) + "_res.csv";
+  }
+
+  resultFile.open(path, std::ios::out | std::ios::trunc);
+
+  if (!resultFile.is_open()) {
+    std::cerr << "warning: unable to open CSV result file '" << path << "'"
+              << std::endl;
+  }
+}
 
 void CSVPrinter::initialize() {
   buffer = DoubleBuffer(1 + getSimulation()->getNumOfPrintableScalarVariables(),
@@ -216,30 +286,14 @@ DoubleBuffer &CSVPrinter::getBuffer() {
 void CSVPrinter::printBufferedValues(const double *values, uint64_t count) {
   SIMULATION_PROFILER_PRINTING_START
 
-  auto &options = printOptions();
-  std::cout.precision(options.precision);
+  ::printValueLine(std::cout, values, count);
 
-  if (options.scientificNotation) {
-    std::cout << std::scientific;
-  } else {
-    std::cout << std::fixed;
+  if (resultFile.is_open()) {
+    // 中文：文件和 stdout 共用同一批缓冲值，保证两边列顺序和数值格式一致。
+    // English: Reuse the same buffered values for the file and stdout so column
+    // order and numeric formatting stay identical.
+    ::printValueLine(resultFile, values, count);
   }
-
-  for (uint64_t i = 0; i < count; ++i) {
-    PRINT_PROFILER_FLOAT_START
-    std::cout << values[i];
-    PRINT_PROFILER_FLOAT_STOP
-
-    if (i + 1 != count) {
-      PRINT_PROFILER_STRING_START
-      std::cout << ',';
-      PRINT_PROFILER_STRING_STOP
-    }
-  }
-
-  PRINT_PROFILER_STRING_START
-  std::cout << std::endl;
-  PRINT_PROFILER_STRING_STOP
 
   SIMULATION_PROFILER_PRINTING_STOP
 }

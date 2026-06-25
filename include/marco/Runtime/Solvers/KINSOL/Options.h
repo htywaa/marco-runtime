@@ -43,6 +43,13 @@ struct Options {
   realtype fnormtol = 0.000001;
   realtype scsteptol = 0.000001;
 
+  // 中文：KINSOL 的默认最大 Newton 步长在全零初值和数组变量整体移动时
+  // 可能过小。0 表示由 runtime 根据系统规模自动选择保守下限。
+  // English: KINSOL's default maximum Newton step can be too small when the
+  // initial guess is zero and many array variables move together. A value of 0
+  // lets the runtime choose a conservative lower bound from the system size.
+  realtype maxNewtonStep = 0;
+
   // Whether to print the Jacobian matrices while debugging.
   bool printJacobian = false;
 

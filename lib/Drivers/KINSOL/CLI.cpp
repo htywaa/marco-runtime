@@ -13,6 +13,7 @@ void CommandLineOptions::printCommandLineOptions(std::ostream &os) const {
   // clang-format off
   os << "  --kinsol-relative-tolerance=<value>     Set the relative tolerance. Defaults to " << getOptions().relativeTolerance << "." << std::endl;
   os << "  --kinsol-absolute-tolerance=<value>     Set the absolute tolerance. Defaults to " << getOptions().absoluteTolerance << "." << std::endl;
+  os << "  --kinsol-equations-chunks-factor=<value> Set the factor which, once multiplied by the threads count, determines the number of equation chunks. Defaults to " << getOptions().equationsChunksFactor << "." << std::endl;
 
   os << "  --kinsol-max-steps=<value>              Set the maximum number of steps to be taken by the solver in its attempt to reach the next output time. Defaults to " << getOptions().maxSteps << "." << std::endl;
   os << "  --kinsol-initial-step-size=<value>      Set the initial step size. Defaults to " << getOptions().initialStepSize << "." << std::endl;
@@ -38,6 +39,7 @@ void CommandLineOptions::parseCommandLineOptions(
   // clang-format off
   options("kinsol-relative-tolerance", getOptions().relativeTolerance) >> getOptions().relativeTolerance;
   options("kinsol-absolute-tolerance", getOptions().absoluteTolerance) >> getOptions().absoluteTolerance;
+  options("kinsol-equations-chunks-factor") >> getOptions().equationsChunksFactor;
   options("kinsol-max-steps", getOptions().maxSteps) >> getOptions().maxSteps;
   options("kinsol-initial-step-size", getOptions().initialStepSize) >> getOptions().initialStepSize;
   options("kinsol-min-step-size", getOptions().minStepSize) >> getOptions().minStepSize;

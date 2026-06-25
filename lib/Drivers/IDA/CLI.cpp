@@ -12,7 +12,7 @@ void CommandLineOptions::printCommandLineOptions(std::ostream &os) const {
   // clang-format off
   os << "  --time-step=<value>                    Set the time step (in seconds)." << std::endl;
 
-  os << "  --ida-equations-chunks-factor          Set the factor which, once multiplied by the threads count, determines the number of equation chunks. Defaults to " << getOptions().equationsChunksFactor << "." << std::endl;
+  os << "  --ida-equations-chunks-factor=<value>  Set the factor which, once multiplied by the threads count, determines the number of equation chunks. Defaults to " << getOptions().equationsChunksFactor << "." << std::endl;
 
   os << "  --ida-relative-tolerance=<value>       Set the relative tolerance. Defaults to " << getOptions().relativeTolerance << "." << std::endl;
   os << "  --ida-absolute-tolerance=<value>       Set the absolute tolerance. Defaults to " << getOptions().absoluteTolerance << "." << std::endl;
@@ -42,20 +42,24 @@ void CommandLineOptions::parseCommandLineOptions(
     const argh::parser &options) const {
   // clang-format off
   getOptions().equidistantTimeGrid = static_cast<bool>(options("time-step") >> getOptions().timeStep);
-  options("ida-equations-chunks-factor") >> getOptions().equationsChunksFactor;
-  options("ida-max-steps") >> getOptions().maxSteps;
-  options("ida-initial-step-size") >> getOptions().initialStepSize;
-  options("ida-min-step-size") >> getOptions().minStepSize;
-  options("ida-max-step-size") >> getOptions().maxStepSize;
-  options("ida-max-err-test-fails") >> getOptions().maxErrTestFails;
+  options("ida-relative-tolerance", getOptions().relativeTolerance) >> getOptions().relativeTolerance;
+  options("ida-absolute-tolerance", getOptions().absoluteTolerance) >> getOptions().absoluteTolerance;
+  options("ida-max-algebraic-abs-tol", getOptions().maxAlgebraicAbsoluteTolerance) >> getOptions().maxAlgebraicAbsoluteTolerance;
+  options("ida-time-scaling-factor-ic", getOptions().timeScalingFactorInit) >> getOptions().timeScalingFactorInit;
+  options("ida-equations-chunks-factor", getOptions().equationsChunksFactor) >> getOptions().equationsChunksFactor;
+  options("ida-max-steps", getOptions().maxSteps) >> getOptions().maxSteps;
+  options("ida-initial-step-size", getOptions().initialStepSize) >> getOptions().initialStepSize;
+  options("ida-min-step-size", getOptions().minStepSize) >> getOptions().minStepSize;
+  options("ida-max-step-size", getOptions().maxStepSize) >> getOptions().maxStepSize;
+  options("ida-max-err-test-fails", getOptions().maxErrTestFails) >> getOptions().maxErrTestFails;
   getOptions().suppressAlg = options["ida-suppress-alg-vars"] ? SUNTRUE : SUNFALSE;
-  options("ida-max-nonlin-iters") >> getOptions().maxNonlinIters;
-  options("ida-max-conv-fails") >> getOptions().maxConvFails;
-  options("ida-nonlin-conv-coef") >> getOptions().nonlinConvCoef;
-  options("ida-nonlin-conv-coef-ic") >> getOptions().nonlinConvCoefIC;
-  options("ida-max-steps-ic") >> getOptions().maxStepsIC;
-  options("ida-max-jacs-ic") >> getOptions().maxNumJacsIC;
-  options("ida-max-iters-ic") >> getOptions().maxNumItersIC;
+  options("ida-max-nonlin-iters", getOptions().maxNonlinIters) >> getOptions().maxNonlinIters;
+  options("ida-max-conv-fails", getOptions().maxConvFails) >> getOptions().maxConvFails;
+  options("ida-nonlin-conv-coef", getOptions().nonlinConvCoef) >> getOptions().nonlinConvCoef;
+  options("ida-nonlin-conv-coef-ic", getOptions().nonlinConvCoefIC) >> getOptions().nonlinConvCoefIC;
+  options("ida-max-steps-ic", getOptions().maxStepsIC) >> getOptions().maxStepsIC;
+  options("ida-max-jacs-ic", getOptions().maxNumJacsIC) >> getOptions().maxNumJacsIC;
+  options("ida-max-iters-ic", getOptions().maxNumItersIC) >> getOptions().maxNumItersIC;
   getOptions().lineSearchOff = options["ida-line-search-off"] ? SUNTRUE : SUNFALSE;
   getOptions().printJacobian = options["ida-print-jacobian"];
   // clang-format on

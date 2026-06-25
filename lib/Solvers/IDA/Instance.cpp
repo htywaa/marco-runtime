@@ -8,10 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <set>
+#include <thread>
 
 using namespace ::marco::runtime;
 using namespace ::marco::runtime::sundials;
@@ -22,6 +25,53 @@ using namespace ::marco::runtime::sundials::ida;
 //===---------------------------------------------------------------------===//
 
 namespace marco::runtime::sundials::ida {
+// 中文：运行期 IDA 探针，用于定位 residual/Jacobian/初始化耗时和并行遍历
+// 进度；默认关闭，设置 MARCO_RUNTIME_IDA_PROBE=0 也视为关闭。
+// English: Runtime IDA probe for residual, Jacobian, initialization timing, and
+// parallel traversal progress. It is disabled by default, and
+// MARCO_RUNTIME_IDA_PROBE=0 is treated as disabled.
+static bool isRuntimeIDAProbeEnabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("MARCO_RUNTIME_IDA_PROBE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+
+  return enabled;
+}
+
+static uint64_t elapsedMillisecondsSince(
+    std::chrono::steady_clock::time_point start) {
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+}
+
+static const char *getParallelIterationKindName(
+    EquationsParallelIterationKind kind) {
+  switch (kind) {
+  case EquationsParallelIterationKind::Residuals:
+    return "residual";
+  case EquationsParallelIterationKind::Jacobian:
+    return "Jacobian";
+  }
+
+  return "unknown";
+}
+
+static void printParallelIterationStats(
+    EquationsParallelIterationKind kind,
+    const std::vector<profiling::ParallelThreadWorkStats> &threadWork,
+    const std::vector<std::thread::id> &threadIds) {
+  std::cerr << "[IDA] " << getParallelIterationKindName(kind)
+            << " parallel iteration work" << std::endl;
+
+  for (size_t i = 0, e = threadWork.size(); i < e; ++i) {
+    std::cerr << "  worker " << i << " (thread " << threadIds[i]
+              << "): chunks=" << threadWork[i].chunks
+              << ", scalar equations=" << threadWork[i].scalarEquations
+              << std::endl;
+  }
+}
+
 IDAInstance::IDAInstance()
     : startTime(simulation::getOptions().startTime),
       endTime(simulation::getOptions().endTime),
@@ -362,6 +412,9 @@ void IDAInstance::addJacobianFunction(Equation equation, Variable variable,
 bool IDAInstance::initialize() {
   assert(!initialized && "The IDA instance has already been initialized");
 
+  const bool runtimeProbe = isRuntimeIDAProbeEnabled();
+  auto initializationStart = std::chrono::steady_clock::now();
+
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Performing initialization" << std::endl;
   }
@@ -385,6 +438,14 @@ bool IDAInstance::initialize() {
 
   assert(getNumOfScalarVariables() == getNumOfScalarEquations() &&
          "Unbalanced system");
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] initialize begin scalar_equations="
+              << scalarEquationsNumber
+              << " scalar_variables=" << scalarVariablesNumber
+              << " vectorized_equations=" << getNumOfVectorizedEquations()
+              << std::endl;
+  }
 
   if (scalarEquationsNumber == 0) {
     // IDA has nothing to solve.
@@ -553,10 +614,15 @@ bool IDAInstance::initialize() {
   jacobianMatrixData.resize(scalarEquationsNumber);
 
   uint64_t numOfVectorizedEquations = getNumOfVectorizedEquations();
+  uint64_t reservedScalarEquations = 0;
+  uint64_t reservedJacobianColumns = 0;
+  auto reservationStart = std::chrono::steady_clock::now();
 
   for (Equation eq = 0; eq < numOfVectorizedEquations; ++eq) {
     std::vector<int64_t> equationIndices;
     getEquationBeginIndices(eq, equationIndices);
+    uint64_t equationScalarEquations = 0;
+    uint64_t equationJacobianColumns = 0;
 
     do {
       uint64_t equationArrayOffset = equationOffsets[eq];
@@ -571,6 +637,19 @@ bool IDAInstance::initialize() {
           computeJacobianColumns(eq, equationIndices.data());
 
       jacobianMatrixData[scalarEquationIndex].resize(jacobianColumns.size());
+      ++reservedScalarEquations;
+      ++equationScalarEquations;
+      reservedJacobianColumns += jacobianColumns.size();
+      equationJacobianColumns += jacobianColumns.size();
+
+      // 运行时探针只在显式启用时打印，用于区分初始化建图和求解回调耗时。
+      if (runtimeProbe && reservedScalarEquations % 1024 == 0) {
+        std::cerr << "[ida-runtime-probe] reserve progress scalar_equations="
+                  << reservedScalarEquations
+                  << " jacobian_columns=" << reservedJacobianColumns
+                  << " elapsed_ms="
+                  << elapsedMillisecondsSince(reservationStart) << std::endl;
+      }
 
       if (marco::runtime::simulation::getOptions().debug) {
         std::cerr << "  - Equation " << eq << std::endl;
@@ -585,16 +664,51 @@ bool IDAInstance::initialize() {
                   << jacobianColumns.size() << std::endl;
       }
     } while (advanceEquationIndices(equationIndices, equationRanges[eq]));
+
+    if (runtimeProbe) {
+      std::cerr << "[ida-runtime-probe] reserve equation_done equation=" << eq
+                << " scalar_equations=" << equationScalarEquations
+                << " jacobian_columns=" << equationJacobianColumns
+                << " total_elapsed_ms="
+                << elapsedMillisecondsSince(reservationStart) << std::endl;
+    }
+  }
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] reserve done scalar_equations="
+              << reservedScalarEquations
+              << " jacobian_columns=" << reservedJacobianColumns
+              << " elapsed_ms=" << elapsedMillisecondsSince(reservationStart)
+              << std::endl;
   }
 
   // Compute the total amount of non-zero values in the Jacobian Matrix.
   computeNNZ();
 
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] computeNNZ done non_zero_values="
+              << nonZeroValuesNumber
+              << " elapsed_ms=" << elapsedMillisecondsSince(initializationStart)
+              << std::endl;
+  }
+
   // Compute the workload for each thread.
   computeThreadChunks();
 
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] computeThreadChunks done chunks="
+              << threadEquationsChunks.size()
+              << " elapsed_ms=" << elapsedMillisecondsSince(initializationStart)
+              << std::endl;
+  }
+
   // Initialize the values of the variables living inside IDA.
   copyVariablesFromMARCO(variablesVector, derivativesVector);
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] copyVariablesFromMARCO done elapsed_ms="
+              << elapsedMillisecondsSince(initializationStart) << std::endl;
+  }
 
   // Create and initialize the memory for IDA.
 #if SUNDIALS_VERSION_MAJOR >= 6
@@ -664,6 +778,11 @@ bool IDAInstance::initialize() {
     std::cerr << "[IDA] Initialization completed" << std::endl;
   }
 
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] initialize done elapsed_ms="
+              << elapsedMillisecondsSince(initializationStart) << std::endl;
+  }
+
   return true;
 }
 
@@ -682,9 +801,23 @@ bool IDAInstance::calcIC() {
   realtype firstOutTime =
       (endTime - startTime) / getOptions().timeScalingFactorInit;
 
+  const bool runtimeProbe = isRuntimeIDAProbeEnabled();
+  auto calcICStart = std::chrono::steady_clock::now();
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] calcIC begin first_out_time="
+              << firstOutTime << std::endl;
+  }
+
   IDA_PROFILER_IC_START
   auto calcICRetVal = IDACalcIC(idaMemory, IDA_YA_YDP_INIT, firstOutTime);
   IDA_PROFILER_IC_STOP
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] calcIC done ret=" << calcICRetVal
+              << " elapsed_ms=" << elapsedMillisecondsSince(calcICStart)
+              << std::endl;
+  }
 
   if (calcICRetVal != IDA_SUCCESS) {
     if (calcICRetVal == IDALS_MEM_NULL) {
@@ -873,6 +1006,15 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
                                   N_Vector derivatives, N_Vector residuals,
                                   void *userData) {
   IDA_PROFILER_RESIDUALS_CALL_COUNTER_INCREMENT
+  static std::atomic<uint64_t> residualCallCounter{0};
+  uint64_t residualCall = ++residualCallCounter;
+  const bool runtimeProbe = isRuntimeIDAProbeEnabled();
+  auto residualStart = std::chrono::steady_clock::now();
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] residual begin call=" << residualCall
+              << " time=" << time << std::endl;
+  }
 
   realtype *rval = N_VGetArrayPointer(residuals);
   auto *instance = static_cast<IDAInstance *>(userData);
@@ -887,6 +1029,7 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
   IDA_PROFILER_RESIDUALS_START
 
   instance->equationsParallelIteration(
+      EquationsParallelIterationKind::Residuals,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
           const JacobianSeedsMap &jacobianSeedsMap) {
         assert(equationIndices.size() == instance->getEquationRank(eq));
@@ -907,6 +1050,12 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
 
   IDA_PROFILER_RESIDUALS_STOP
 
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] residual done call=" << residualCall
+              << " elapsed_ms=" << elapsedMillisecondsSince(residualStart)
+              << std::endl;
+  }
+
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Residuals function called" << std::endl;
     std::cerr << "Variables:" << std::endl;
@@ -926,6 +1075,15 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
                                 void *userData, N_Vector tempv1,
                                 N_Vector tempv2, N_Vector tempv3) {
   IDA_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT
+  static std::atomic<uint64_t> jacobianCallCounter{0};
+  uint64_t jacobianCall = ++jacobianCallCounter;
+  const bool runtimeProbe = isRuntimeIDAProbeEnabled();
+  auto jacobianStart = std::chrono::steady_clock::now();
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] jacobian begin call=" << jacobianCall
+              << " time=" << time << " alpha=" << alpha << std::endl;
+  }
 
   realtype *jacobian = SUNSparseMatrix_Data(jacobianMatrix);
   auto *instance = static_cast<IDAInstance *>(userData);
@@ -940,6 +1098,7 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
   IDA_PROFILER_PARTIAL_DERIVATIVES_START
 
   instance->equationsParallelIteration(
+      EquationsParallelIterationKind::Jacobian,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
           const JacobianSeedsMap &jacobianSeedsMap) {
         uint64_t equationArrayOffset = instance->equationOffsets[eq];
@@ -1013,6 +1172,12 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
          SUNSparseMatrix_Data(jacobianMatrix) + instance->nonZeroValuesNumber);
 
   IDA_PROFILER_PARTIAL_DERIVATIVES_STOP
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] jacobian done call=" << jacobianCall
+              << " elapsed_ms=" << elapsedMillisecondsSince(jacobianStart)
+              << std::endl;
+  }
 
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Jacobian matrix function called" << std::endl;
@@ -1116,6 +1281,26 @@ IDAInstance::computeJacobianColumns(Equation eq,
       variableIndices.resize(variableRank, 0);
       accessFunction(equationIndices, variableIndices.data());
 
+      bool accessOutOfBounds = false;
+
+      for (uint64_t i = 0; i < variableRank; ++i) {
+        if (variableIndices[i] >= variablesDimensions[variable][i]) {
+          accessOutOfBounds = true;
+          break;
+        }
+      }
+
+      if (accessOutOfBounds) {
+        // 中文：预计算的 affine access 可能描述边界 stencil。在边界行上，
+        // 某些邻居会映射到变量范围之外；这些列不可能是 Jacobian 非零项，
+        // Release 构建中也必须跳过，避免 uint64_t 下标回绕破坏稀疏矩阵结构。
+        // English: Precomputed affine accesses may describe boundary stencils.
+        // On boundary rows, some neighbors map outside the variable range; such
+        // columns cannot be Jacobian nonzeros and must be skipped even in
+        // release builds to avoid uint64_t wraparound corrupting sparsity.
+        continue;
+      }
+
       assert([&]() -> bool {
         for (uint64_t i = 0; i < variableRank; ++i) {
           if (variableIndices[i] >= variablesDimensions[variable][i]) {
@@ -1206,7 +1391,8 @@ void IDAInstance::computeNNZ() {
 void IDAInstance::computeThreadChunks() {
   unsigned int numOfThreads = threadPool.getNumOfThreads();
 
-  int64_t chunksFactor = getOptions().equationsChunksFactor;
+  int64_t chunksFactor =
+      std::max<int64_t>(1, getOptions().equationsChunksFactor);
   int64_t numOfChunks = numOfThreads * chunksFactor;
 
   uint64_t numOfVectorizedEquations = getNumOfVectorizedEquations();
@@ -1406,19 +1592,38 @@ void IDAInstance::copyVariablesIntoMARCO(
 }
 
 void IDAInstance::equationsParallelIteration(
-    std::function<void(Equation equation,
-                       const std::vector<int64_t> &equationIndices,
-                       const JacobianSeedsMap &jacobianSeedsMap)>
-        processFn) {
-  // Shard the work among multiple threads.
+    EquationsParallelIterationKind kind,
+  std::function<void(Equation equation,
+                     const std::vector<int64_t> &equationIndices,
+                     const JacobianSeedsMap &jacobianSeedsMap)>
+      processFn) {
+  // 中文：按 chunk 把 vectorized equation 的标量点分给线程；profiling/debug
+  // 模式会记录每个 worker 的实际负载。
+  // English: Shard scalar points of vectorized equations across worker chunks;
+  // profiling/debug mode records the actual work handled by each worker.
   unsigned int numOfThreads = threadPool.getNumOfThreads();
   std::atomic_size_t chunkIndex = 0;
+  const auto &simulationOptions = marco::runtime::simulation::getOptions();
+  bool collectStats = simulationOptions.debug || simulationOptions.profiling;
+  std::vector<profiling::ParallelThreadWorkStats> threadWork(numOfThreads);
+  std::vector<std::thread::id> threadIds(numOfThreads);
+  const bool runtimeProbe = isRuntimeIDAProbeEnabled();
+  auto iterationStart = std::chrono::steady_clock::now();
+  std::atomic<uint64_t> processedScalarEquations{0};
 
   for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
-    threadPool.async([&]() {
+    threadPool.async([&, thread]() {
+      if (collectStats) {
+        threadIds[thread] = std::this_thread::get_id();
+      }
+
       size_t assignedChunk;
 
       while ((assignedChunk = chunkIndex++) < threadEquationsChunks.size()) {
+        if (collectStats) {
+          ++threadWork[thread].chunks;
+        }
+
         const ThreadEquationsChunk &chunk =
             threadEquationsChunks[assignedChunk];
 
@@ -1442,6 +1647,22 @@ void IDAInstance::equationsParallelIteration(
           }() && "Invalid equation indices");
 
           processFn(equation, equationIndices, std::get<3>(chunk));
+
+          if (runtimeProbe) {
+            uint64_t processed = ++processedScalarEquations;
+            if (processed % 1024 == 0) {
+              std::cerr << "[ida-runtime-probe] "
+                        << getParallelIterationKindName(kind)
+                        << " progress scalar_equations=" << processed
+                        << " elapsed_ms="
+                        << elapsedMillisecondsSince(iterationStart)
+                        << std::endl;
+            }
+          }
+
+          if (collectStats) {
+            ++threadWork[thread].scalarEquations;
+          }
         } while (advanceEquationIndicesUntil(
             equationIndices, equationRanges[equation], std::get<2>(chunk)));
       }
@@ -1449,6 +1670,24 @@ void IDAInstance::equationsParallelIteration(
   }
 
   threadPool.wait();
+
+  if (runtimeProbe) {
+    std::cerr << "[ida-runtime-probe] " << getParallelIterationKindName(kind)
+              << " iteration done scalar_equations="
+              << processedScalarEquations.load()
+              << " elapsed_ms=" << elapsedMillisecondsSince(iterationStart)
+              << std::endl;
+  }
+
+  if (simulationOptions.debug) {
+    printParallelIterationStats(kind, threadWork, threadIds);
+  }
+
+  if (kind == EquationsParallelIterationKind::Residuals) {
+    IDA_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(threadWork)
+  } else {
+    IDA_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(threadWork)
+  }
 }
 
 void IDAInstance::getVariableBeginIndices(
@@ -2026,8 +2265,10 @@ RUNTIME_FUNC_DEF(idaCreate, PTR(void))
 // idaCalcIC
 
 static void idaCalcIC_void(void *instance) {
-  [[maybe_unused]] bool result = static_cast<IDAInstance *>(instance)->calcIC();
-  assert(result && "Can't compute the initial values of the variables");
+  bool result = static_cast<IDAInstance *>(instance)->calcIC();
+  if (!result) {
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 RUNTIME_FUNC_DEF(idaCalcIC, void, PTR(void))
@@ -2036,8 +2277,10 @@ RUNTIME_FUNC_DEF(idaCalcIC, void, PTR(void))
 // idaStep
 
 static void idaStep_void(void *instance) {
-  [[maybe_unused]] bool result = static_cast<IDAInstance *>(instance)->step();
-  assert(result && "IDA step failed");
+  bool result = static_cast<IDAInstance *>(instance)->step();
+  if (!result) {
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 RUNTIME_FUNC_DEF(idaStep, void, PTR(void))

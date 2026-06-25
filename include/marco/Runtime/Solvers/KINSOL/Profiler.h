@@ -7,6 +7,7 @@
 #include "marco/Runtime/Profiling/Timer.h"
 #include "marco/Runtime/Simulation/Options.h"
 #include <mutex>
+#include <vector>
 
 namespace marco::runtime::profiling {
 class KINSOLProfiler : public Profiler {
@@ -21,11 +22,25 @@ public:
 
   void incrementPartialDerivativesCallCounter();
 
+  // 中文：累加 residual 并行遍历的 worker 负载统计。
+  // English: Accumulate per-worker load statistics for residual parallel
+  // traversals.
+  void recordResidualsParallelWork(
+      const std::vector<ParallelThreadWorkStats> &threadWork);
+
+  // 中文：累加 Jacobian 并行遍历的 worker 负载统计。
+  // English: Accumulate per-worker load statistics for Jacobian parallel
+  // traversals.
+  void recordPartialDerivativesParallelWork(
+      const std::vector<ParallelThreadWorkStats> &threadWork);
+
 public:
   int64_t residualsCallCounter{0};
   Timer residualsTimer;
+  std::vector<ParallelThreadWorkStats> residualsParallelWork;
   int64_t partialDerivativesCallCounter{0};
   Timer partialDerivativesTimer;
+  std::vector<ParallelThreadWorkStats> partialDerivativesParallelWork;
   Timer copyVarsFromMARCOTimer;
   Timer copyVarsIntoMARCOTimer;
 
@@ -61,6 +76,12 @@ KINSOLProfiler &kinsolProfiler();
     ::marco::runtime::profiling::kinsolProfiler().residualsTimer.stop();      \
   }
 
+#define KINSOL_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(stats)                  \
+  if (::marco::runtime::simulation::getOptions().profiling) {                  \
+    ::marco::runtime::profiling::kinsolProfiler()                              \
+        .recordResidualsParallelWork(stats);                                   \
+  }
+
 #define KINSOL_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT                          \
   if (::marco::runtime::simulation::getOptions().profiling) {                               \
     ::marco::runtime::profiling::kinsolProfiler().incrementPartialDerivativesCallCounter(); \
@@ -74,6 +95,12 @@ KINSOLProfiler &kinsolProfiler();
 #define KINSOL_PROFILER_PARTIAL_DERIVATIVES_STOP                                  \
   if (::marco::runtime::simulation::getOptions().profiling) {                     \
     ::marco::runtime::profiling::kinsolProfiler().partialDerivativesTimer.stop(); \
+  }
+
+#define KINSOL_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(stats)          \
+  if (::marco::runtime::simulation::getOptions().profiling) {                    \
+    ::marco::runtime::profiling::kinsolProfiler()                                \
+        .recordPartialDerivativesParallelWork(stats);                            \
   }
 
 #define KINSOL_PROFILER_COPY_VARS_FROM_MARCO_START                                \
@@ -109,12 +136,16 @@ KINSOLProfiler &kinsolProfiler();
 
 #define KINSOL_PROFILER_RESIDUALS_START KINSOL_PROFILER_DO_NOTHING
 #define KINSOL_PROFILER_RESIDUALS_STOP KINSOL_PROFILER_DO_NOTHING
+#define KINSOL_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(stats)                  \
+  KINSOL_PROFILER_DO_NOTHING
 
 #define KINSOL_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT             \
   KINSOL_PROFILER_DO_NOTHING
 
 #define KINSOL_PROFILER_PARTIAL_DERIVATIVES_START KINSOL_PROFILER_DO_NOTHING
 #define KINSOL_PROFILER_PARTIAL_DERIVATIVES_STOP KINSOL_PROFILER_DO_NOTHING
+#define KINSOL_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(stats)        \
+  KINSOL_PROFILER_DO_NOTHING
 
 #define KINSOL_PROFILER_COPY_VARS_FROM_MARCO_START KINSOL_PROFILER_DO_NOTHING
 #define KINSOL_PROFILER_COPY_VARS_FROM_MARCO_STOP KINSOL_PROFILER_DO_NOTHING

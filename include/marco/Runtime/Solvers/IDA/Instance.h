@@ -55,6 +55,8 @@ using JacobianSeedsMap = std::map<JacobianFunction, std::vector<uint64_t>>;
 using ThreadEquationsChunk = std::tuple<Equation, std::vector<int64_t>,
                                         std::vector<int64_t>, JacobianSeedsMap>;
 
+enum class EquationsParallelIterationKind { Residuals, Jacobian };
+
 class IDAInstance {
 public:
   IDAInstance();
@@ -175,6 +177,7 @@ private:
                               N_Vector derivativeVariablesVector);
 
   void equationsParallelIteration(
+      EquationsParallelIterationKind kind,
       std::function<void(Equation equation,
                          const std::vector<int64_t> &equationIndices,
                          const JacobianSeedsMap &jacobianSeedsMap)>

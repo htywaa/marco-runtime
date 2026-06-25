@@ -51,6 +51,8 @@ using JacobianSeedsMap = std::map<JacobianFunction, std::vector<uint64_t>>;
 using ThreadEquationsChunk = std::tuple<Equation, std::vector<int64_t>,
                                         std::vector<int64_t>, JacobianSeedsMap>;
 
+enum class EquationsParallelIterationKind { Residuals, Jacobian };
+
 class KINSOLInstance {
 public:
   KINSOLInstance();
@@ -133,6 +135,7 @@ private:
   void copyVariablesIntoMARCO(N_Vector variables);
 
   void equationsParallelIteration(
+      EquationsParallelIterationKind kind,
       std::function<void(Equation equation,
                          const std::vector<int64_t> &equationIndices,
                          const JacobianSeedsMap &jacobianSeedsMap)>
@@ -157,6 +160,7 @@ private:
   bool kinsolInit();
   bool kinsolFNTolerance();
   bool kinsolSSTolerance();
+  bool kinsolMaxNewtonStep();
   bool kinsolSetLinearSolver();
   bool kinsolSetUserData();
   bool kinsolSetJacobianFunction();

@@ -7,6 +7,7 @@
 #include "marco/Runtime/Profiling/Timer.h"
 #include "marco/Runtime/Simulation/Options.h"
 #include <mutex>
+#include <vector>
 
 namespace marco::runtime::profiling {
 class IDAProfiler : public Profiler {
@@ -23,6 +24,18 @@ public:
 
   void incrementPartialDerivativesCallCounter();
 
+  // 中文：累加 residual 并行遍历的 worker 负载统计。
+  // English: Accumulate per-worker load statistics for residual parallel
+  // traversals.
+  void recordResidualsParallelWork(
+      const std::vector<ParallelThreadWorkStats> &threadWork);
+
+  // 中文：累加 Jacobian 并行遍历的 worker 负载统计。
+  // English: Accumulate per-worker load statistics for Jacobian parallel
+  // traversals.
+  void recordPartialDerivativesParallelWork(
+      const std::vector<ParallelThreadWorkStats> &threadWork);
+
 public:
   Timer initialConditionsTimer;
   int64_t stepsCounter{0};
@@ -30,8 +43,10 @@ public:
   Timer algebraicVariablesTimer;
   int64_t residualsCallCounter{0};
   Timer residualsTimer;
+  std::vector<ParallelThreadWorkStats> residualsParallelWork;
   int64_t partialDerivativesCallCounter{0};
   Timer partialDerivativesTimer;
+  std::vector<ParallelThreadWorkStats> partialDerivativesParallelWork;
   Timer copyVarsFromMARCOTimer;
   Timer copyVarsIntoMARCOTimer;
 
@@ -92,6 +107,12 @@ IDAProfiler &idaProfiler();
     ::marco::runtime::profiling::idaProfiler().residualsTimer.stop();         \
   }
 
+#define IDA_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(stats)                    \
+  if (::marco::runtime::simulation::getOptions().profiling) {                 \
+    ::marco::runtime::profiling::idaProfiler().recordResidualsParallelWork(   \
+        stats);                                                               \
+  }
+
 #define IDA_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT                          \
   if (::marco::runtime::simulation::getOptions().profiling) {                            \
     ::marco::runtime::profiling::idaProfiler().incrementPartialDerivativesCallCounter(); \
@@ -105,6 +126,12 @@ IDAProfiler &idaProfiler();
 #define IDA_PROFILER_PARTIAL_DERIVATIVES_STOP                                  \
   if (::marco::runtime::simulation::getOptions().profiling) {                  \
     ::marco::runtime::profiling::idaProfiler().partialDerivativesTimer.stop(); \
+  }
+
+#define IDA_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(stats)           \
+  if (::marco::runtime::simulation::getOptions().profiling) {                  \
+    ::marco::runtime::profiling::idaProfiler()                                 \
+        .recordPartialDerivativesParallelWork(stats);                          \
   }
 
 #define IDA_PROFILER_COPY_VARS_FROM_MARCO_START                                \
@@ -147,12 +174,16 @@ IDAProfiler &idaProfiler();
 
 #define IDA_PROFILER_RESIDUALS_START IDA_PROFILER_DO_NOTHING
 #define IDA_PROFILER_RESIDUALS_STOP IDA_PROFILER_DO_NOTHING
+#define IDA_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(stats)                    \
+  IDA_PROFILER_DO_NOTHING
 
 #define IDA_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT                \
   IDA_PROFILER_DO_NOTHING
 
 #define IDA_PROFILER_PARTIAL_DERIVATIVES_START IDA_PROFILER_DO_NOTHING
 #define IDA_PROFILER_PARTIAL_DERIVATIVES_STOP IDA_PROFILER_DO_NOTHING
+#define IDA_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(stats)          \
+  IDA_PROFILER_DO_NOTHING
 
 #define IDA_PROFILER_COPY_VARS_FROM_MARCO_START IDA_PROFILER_DO_NOTHING
 #define IDA_PROFILER_COPY_VARS_FROM_MARCO_STOP IDA_PROFILER_DO_NOTHING

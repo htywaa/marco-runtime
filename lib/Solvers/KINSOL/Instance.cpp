@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <set>
+#include <thread>
 
 using namespace marco::runtime::sundials;
 using namespace marco::runtime::sundials::kinsol;
@@ -22,6 +24,34 @@ using namespace marco::runtime::sundials::kinsol;
 //===---------------------------------------------------------------------===//
 
 namespace marco::runtime::sundials::kinsol {
+static const char *getParallelIterationKindName(
+    EquationsParallelIterationKind kind) {
+  switch (kind) {
+  case EquationsParallelIterationKind::Residuals:
+    return "residual";
+  case EquationsParallelIterationKind::Jacobian:
+    return "Jacobian";
+  }
+
+  return "unknown";
+}
+
+static void printParallelIterationStats(
+    EquationsParallelIterationKind kind,
+    const std::vector<::marco::runtime::profiling::ParallelThreadWorkStats>
+        &threadWork,
+    const std::vector<std::thread::id> &threadIds) {
+  std::cerr << "[KINSOL] " << getParallelIterationKindName(kind)
+            << " parallel iteration work" << std::endl;
+
+  for (size_t i = 0, e = threadWork.size(); i < e; ++i) {
+    std::cerr << "  worker " << i << " (thread " << threadIds[i]
+              << "): chunks=" << threadWork[i].chunks
+              << ", scalar equations=" << threadWork[i].scalarEquations
+              << std::endl;
+  }
+}
+
 KINSOLInstance::KINSOLInstance() {
 #if SUNDIALS_VERSION_MAJOR >= 7
 #ifdef MPI_ENABLE
@@ -460,6 +490,10 @@ bool KINSOLInstance::initialize() {
     return false;
   }
 
+  if (!kinsolMaxNewtonStep()) {
+    return false;
+  }
+
   // Create sparse SUNMatrix for use in linear solver.
 #if SUNDIALS_VERSION_MAJOR >= 6
   sparseMatrix = SUNSparseMatrix(
@@ -554,6 +588,7 @@ int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
   KINSOL_PROFILER_RESIDUALS_START
 
   instance->equationsParallelIteration(
+      EquationsParallelIterationKind::Residuals,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
           const JacobianSeedsMap &jacobianSeedsMap) {
         assert(equationIndices.size() == instance->getEquationRank(eq));
@@ -601,6 +636,7 @@ int KINSOLInstance::jacobianMatrix(N_Vector variables, N_Vector residuals,
   KINSOL_PROFILER_PARTIAL_DERIVATIVES_START
 
   instance->equationsParallelIteration(
+      EquationsParallelIterationKind::Jacobian,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
           const JacobianSeedsMap &jacobianSeedsMap) {
         uint64_t equationArrayOffset = instance->equationOffsets[eq];
@@ -861,7 +897,8 @@ void KINSOLInstance::computeNNZ() {
 void KINSOLInstance::computeThreadChunks() {
   unsigned int numOfThreads = threadPool.getNumOfThreads();
 
-  int64_t chunksFactor = getOptions().equationsChunksFactor;
+  int64_t chunksFactor =
+      std::max<int64_t>(1, getOptions().equationsChunksFactor);
   int64_t numOfChunks = numOfThreads * chunksFactor;
 
   uint64_t numOfVectorizedEquations = getNumOfVectorizedEquations();
@@ -1011,6 +1048,7 @@ void KINSOLInstance::copyVariablesIntoMARCO(N_Vector variables) {
 }
 
 void KINSOLInstance::equationsParallelIteration(
+    EquationsParallelIterationKind kind,
     std::function<void(Equation equation,
                        const std::vector<int64_t> &equationIndices,
                        const JacobianSeedsMap &jacobianSeedsMap)>
@@ -1018,12 +1056,25 @@ void KINSOLInstance::equationsParallelIteration(
   // Shard the work among multiple threads.
   unsigned int numOfThreads = threadPool.getNumOfThreads();
   std::atomic_size_t chunkIndex = 0;
+  const auto &simulationOptions = marco::runtime::simulation::getOptions();
+  bool collectStats = simulationOptions.debug || simulationOptions.profiling;
+  std::vector<::marco::runtime::profiling::ParallelThreadWorkStats> threadWork(
+      numOfThreads);
+  std::vector<std::thread::id> threadIds(numOfThreads);
 
   for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
-    threadPool.async([&]() {
+    threadPool.async([&, thread]() {
+      if (collectStats) {
+        threadIds[thread] = std::this_thread::get_id();
+      }
+
       size_t assignedChunk;
 
       while ((assignedChunk = chunkIndex++) < threadEquationsChunks.size()) {
+        if (collectStats) {
+          ++threadWork[thread].chunks;
+        }
+
         const ThreadEquationsChunk &chunk =
             threadEquationsChunks[assignedChunk];
 
@@ -1047,6 +1098,10 @@ void KINSOLInstance::equationsParallelIteration(
           }() && "Invalid equation indices");
 
           processFn(equation, equationIndices, std::get<3>(chunk));
+
+          if (collectStats) {
+            ++threadWork[thread].scalarEquations;
+          }
         } while (advanceEquationIndicesUntil(
             equationIndices, equationRanges[equation], std::get<2>(chunk)));
       }
@@ -1054,6 +1109,16 @@ void KINSOLInstance::equationsParallelIteration(
   }
 
   threadPool.wait();
+
+  if (simulationOptions.debug) {
+    printParallelIterationStats(kind, threadWork, threadIds);
+  }
+
+  if (kind == EquationsParallelIterationKind::Residuals) {
+    KINSOL_PROFILER_RESIDUALS_PARALLEL_WORK_RECORD(threadWork)
+  } else {
+    KINSOL_PROFILER_PARTIAL_DERIVATIVES_PARALLEL_WORK_RECORD(threadWork)
+  }
 }
 
 void KINSOLInstance::getVariableBeginIndices(
@@ -1150,6 +1215,37 @@ bool KINSOLInstance::kinsolSSTolerance() {
   if (retVal == KIN_ILL_INPUT) {
     std::cerr << "KINSVtolerances - The relative error tolerance was negative "
                  "or the absolute tolerance vector had a negative component"
+              << std::endl;
+    return false;
+  }
+
+  return retVal == KIN_SUCCESS;
+}
+
+bool KINSOLInstance::kinsolMaxNewtonStep() {
+  realtype maxNewtonStep = getOptions().maxNewtonStep;
+
+  if (maxNewtonStep <= 0) {
+    // 中文：max Newton step 是缩放后的向量范数限制。对数组代数块，即使
+    // 每个分量只需移动 O(1)，整体范数也会随 sqrt(N) 增长。
+    // English: The maximum Newton step limits the scaled vector norm. For array
+    // algebraic blocks, even O(1) movement per component makes the total norm
+    // grow with sqrt(N).
+    maxNewtonStep = std::max<realtype>(
+        100, 10 * std::sqrt(static_cast<realtype>(scalarVariablesNumber)));
+  }
+
+  auto retVal = KINSetMaxNewtonStep(kinsolMemory, maxNewtonStep);
+
+  if (retVal == KIN_MEM_NULL) {
+    std::cerr << "KINSetMaxNewtonStep - The kinsol_mem pointer is NULL"
+              << std::endl;
+    return false;
+  }
+
+  if (retVal == KIN_ILL_INPUT) {
+    std::cerr << "KINSetMaxNewtonStep - The maximum Newton step is not "
+                 "positive"
               << std::endl;
     return false;
   }
