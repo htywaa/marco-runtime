@@ -5,11 +5,13 @@
 #include "marco/Runtime/Simulation/Options.h"
 #include "marco/Runtime/Solvers/KINSOL/Options.h"
 #include "marco/Runtime/Solvers/KINSOL/Profiler.h"
+#include "marco/Runtime/Solvers/KINSOL/SparseNonlinearSystem.h"
 #include "marco/Runtime/Support/MemoryManagement.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -53,14 +55,6 @@ static void printParallelIterationStats(
 }
 
 KINSOLInstance::KINSOLInstance() {
-#if SUNDIALS_VERSION_MAJOR >= 7
-#ifdef MPI_ENABLE
-  comm = MPI_COMM_WORLD;
-#else
-  comm = SUN_COMM_NULL;
-#endif
-#endif
-
   // Initially there is are no variables or equations in the instance.
   variableOffsets.push_back(0);
   equationOffsets.push_back(0);
@@ -71,21 +65,6 @@ KINSOLInstance::KINSOLInstance() {
 }
 
 KINSOLInstance::~KINSOLInstance() {
-  if (getNumOfScalarEquations() != 0) {
-    N_VDestroy(variablesVector);
-    N_VDestroy(tolerancesVector);
-
-    KINFree(&kinsolMemory);
-    SUNLinSolFree(linearSolver);
-    SUNMatDestroy(sparseMatrix);
-  }
-
-#if SUNDIALS_VERSION_MAJOR >= 6
-  if (ctx != nullptr) {
-    SUNContext_Free(&ctx);
-  }
-#endif
-
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Instance destroyed" << std::endl;
   }
@@ -124,6 +103,12 @@ Variable KINSOLInstance::addVariable(uint64_t rank, const uint64_t *dimensions,
   // Store the getter and setter functions.
   variableGetters.push_back(getterFunction);
   variableSetters.push_back(setterFunction);
+  // 中文：nominal getter 与 variable ID 平行占位，允许调用方稍后在 initialize
+  // 前补充显式尺度，而不改变 descriptor 编号。
+  // English: Reserve a nominal-getter slot parallel to the variable ID so a
+  // caller may attach explicit scaling before initialize without renumbering
+  // descriptors.
+  variableNominalGetters.push_back(nullptr);
 
   // Return the index of the variable.
   Variable id = getNumOfArrayVariables() - 1;
@@ -149,6 +134,21 @@ Variable KINSOLInstance::addVariable(uint64_t rank, const uint64_t *dimensions,
   }
 
   return id;
+}
+
+bool KINSOLInstance::setVariableNominalGetter(
+    Variable variable, VariableGetter nominalGetter) {
+  // 中文：nominal getter 属于变量描述的一部分，初始化后禁止更改，避免已建立的
+  // KINSOL scaling 与 MARCO 元数据分叉。
+  // English: A nominal getter is part of the variable descriptor and cannot
+  // change after initialization, preventing KINSOL scaling from diverging
+  // from MARCO metadata.
+  if (initialized || nominalGetter == nullptr ||
+      variable >= variableNominalGetters.size()) {
+    return false;
+  }
+  variableNominalGetters[variable] = nominalGetter;
+  return true;
 }
 
 Equation KINSOLInstance::addEquation(const int64_t *ranges,
@@ -240,6 +240,26 @@ void KINSOLInstance::setResidualFunction(Equation equation,
   residualFunctions[equation] = residualFunction;
 }
 
+void KINSOLInstance::setTimedResidualFunction(
+    Equation equation, TimedResidualFunction residualFunction) {
+  // 中文：timed 表与普通表按相同 equation ID 对齐；实际求值优先 timed callback，
+  // 因而 component closure 可读取当前 IDA time 而不改变既有 ABI。
+  // English: The timed table aligns with ordinary equation IDs. Evaluation
+  // prefers the timed callback, letting component closures observe current IDA
+  // time without changing the established ABI.
+  if (timedResidualFunctions.size() <= equation) {
+    timedResidualFunctions.resize(equation + 1, nullptr);
+  }
+  timedResidualFunctions[equation] = residualFunction;
+}
+
+void KINSOLInstance::setTimedResidualPostprocessor(
+    TimedResidualPostprocessor callback) {
+  assert(!initialized && "KINSOL residual postprocessor must be set before "
+                         "initialize");
+  timedResidualPostprocessor = std::move(callback);
+}
+
 void KINSOLInstance::addJacobianFunction(Equation equation, Variable variable,
                                          JacobianFunction jacobianFunction,
                                          uint64_t numOfSeeds,
@@ -284,6 +304,28 @@ void KINSOLInstance::addJacobianFunction(Equation equation, Variable variable,
   }
 }
 
+void KINSOLInstance::addTimedJacobianFunction(
+    Equation equation, Variable variable,
+    TimedJacobianFunction jacobianFunction, uint64_t numOfSeeds,
+    uint64_t *seedSizes) {
+  // 中文：seed shape 与 callback 一起保存，后续 chunk 构造按真实 callback 地址
+  // 分配 AD buffer；timed-only 配置不依赖空的普通 callback。
+  // English: Seed shapes are stored with the callback. Chunk construction
+  // allocates AD buffers by the actual callback address, so timed-only
+  // configurations never depend on a null ordinary callback.
+  if (timedJacobianFunctions.size() <= equation) {
+    timedJacobianFunctions.resize(equation + 1, {});
+  }
+  if (timedJacobianFunctions[equation].size() <= variable) {
+    timedJacobianFunctions[equation].resize(
+        variable + 1,
+        std::make_pair(nullptr, std::vector<uint64_t>{}));
+  }
+  auto &descriptor = timedJacobianFunctions[equation][variable];
+  descriptor.first = jacobianFunction;
+  descriptor.second.assign(seedSizes, seedSizes + numOfSeeds);
+}
+
 bool KINSOLInstance::initialize() {
   assert(!initialized && "KINSOL instance has already been initialized");
 
@@ -316,104 +358,51 @@ bool KINSOLInstance::initialize() {
     return true;
   }
 
-  // Create the SUNDIALS context.
-#if SUNDIALS_VERSION_MAJOR >= 7
-  if (SUNContext_Create(comm, &ctx) != 0) {
-    return false;
-  }
-#elif SUNDIALS_VERSION_MAJOR >= 6
-  if (SUNContext_Create(nullptr, &ctx) != 0) {
-    return false;
-  }
-#endif
-
-  // Create and initialize the variables vector.
-#if SUNDIALS_VERSION_MAJOR >= 6
-  variablesVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber), ctx);
-#else
-  variablesVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber));
-#endif
-
-  assert(
-      checkAllocation(static_cast<void *>(variablesVector), "N_VNew_Serial"));
-
-  for (uint64_t i = 0; i < scalarVariablesNumber; ++i) {
-    N_VGetArrayPointer(variablesVector)[i] = 0;
-  }
-
-  // Create and initialize the tolerances vector.
-#if SUNDIALS_VERSION_MAJOR >= 6
-  tolerancesVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber), ctx);
-#else
-  tolerancesVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber));
-#endif
-
-  assert(
-      checkAllocation(static_cast<void *>(tolerancesVector), "N_VNew_Serial"));
-
-  for (Variable var = 0; var < getNumOfArrayVariables(); ++var) {
-    uint64_t arrayOffset = variableOffsets[var];
-    uint64_t flatSize = getVariableFlatSize(var);
-
-    for (uint64_t scalarOffset = 0; scalarOffset < flatSize; ++scalarOffset) {
-      uint64_t offset = arrayOffset + scalarOffset;
-
-      N_VGetArrayPointer(tolerancesVector)[offset] =
-          std::min(getOptions().maxAlgebraicAbsoluteTolerance,
-                   getOptions().absoluteTolerance);
+  // 中文：局部 component 可使用普通或带时间参数的 callback；初始化在 release
+  // 构建中也执行完整性检查，缺失函数不会依赖 assert 后继续运行。
+  // English: A local component may use ordinary or time-aware callbacks.
+  // Initialization validates completeness in release builds as well, rather
+  // than relying on assertions that may disappear.
+  assert(residualFunctions.size() == getNumOfVectorizedEquations() ||
+         timedResidualFunctions.size() == getNumOfVectorizedEquations());
+  for (Equation equation = 0, e = getNumOfVectorizedEquations(); equation < e;
+       ++equation) {
+    bool hasResidual = equation < residualFunctions.size() &&
+                       residualFunctions[equation] != nullptr;
+    bool hasTimedResidual = equation < timedResidualFunctions.size() &&
+                            timedResidualFunctions[equation] != nullptr;
+    if (!hasResidual && !hasTimedResidual) {
+      std::cerr << "KINSOL local component is missing a residual callback"
+                << std::endl;
+      return false;
     }
   }
 
-#if SUNDIALS_VERSION_MAJOR >= 6
-  variableScaleVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber), ctx);
-#else
-  variableScaleVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber));
-#endif
-
-#if SUNDIALS_VERSION_MAJOR >= 6
-  residualScaleVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber), ctx);
-#else
-  residualScaleVector =
-      N_VNew_Serial(static_cast<sunindextype>(scalarVariablesNumber));
-#endif
-
-  for (uint64_t i = 0; i < scalarVariablesNumber; ++i) {
-    N_VGetArrayPointer(variableScaleVector)[i] = 1;
-    N_VGetArrayPointer(residualScaleVector)[i] = 1;
+  // 中文：没有预计算 access 时，每个 equation-variable 对必须提供普通或 timed
+  // Jacobian callback。
+  // English: Without precomputed accesses, every equation-variable pair needs
+  // either the time-independent or the time-aware Jacobian callback.
+  if (!precomputedAccesses) {
+    for (Equation equation = 0, e = getNumOfVectorizedEquations(); equation < e;
+         ++equation) {
+      for (Variable variable = 0, v = variableGetters.size(); variable < v;
+           ++variable) {
+        bool hasJacobian = equation < jacobianFunctions.size() &&
+                           variable < jacobianFunctions[equation].size() &&
+                           jacobianFunctions[equation][variable].first !=
+                               nullptr;
+        bool hasTimedJacobian =
+            equation < timedJacobianFunctions.size() &&
+            variable < timedJacobianFunctions[equation].size() &&
+            timedJacobianFunctions[equation][variable].first != nullptr;
+        if (!hasJacobian && !hasTimedJacobian) {
+          std::cerr << "KINSOL is missing a Jacobian callback for equation "
+                    << equation << " and variable " << variable << std::endl;
+          return false;
+        }
+      }
+    }
   }
-
-  // Check that all the residual functions have been set.
-  assert(residualFunctions.size() == getNumOfVectorizedEquations());
-
-  assert(std::all_of(
-      residualFunctions.begin(), residualFunctions.end(),
-      [](const ResidualFunction &function) { return function != nullptr; }));
-
-  // Check if the KINSOL instance is not informed about the accesses that all
-  // the jacobian functions have been set.
-  assert(precomputedAccesses ||
-         jacobianFunctions.size() == getNumOfVectorizedEquations());
-
-  assert(precomputedAccesses ||
-         std::all_of(jacobianFunctions.begin(), jacobianFunctions.end(),
-                     [&](std::vector<JacobianFunctionDescriptor> functions) {
-                       if (functions.size() != variableGetters.size()) {
-                         return false;
-                       }
-
-                       return std::all_of(
-                           functions.begin(), functions.end(),
-                           [](const JacobianFunctionDescriptor &function) {
-                             return function.first != nullptr;
-                           });
-                     }));
 
   // Check that all the getters and setters have been set.
   assert(
@@ -475,58 +464,35 @@ bool KINSOLInstance::initialize() {
   // Compute the equation chunks for each thread.
   computeThreadChunks();
 
-  // Create and initialize the memory for KINSOL.
-#if SUNDIALS_VERSION_MAJOR >= 6
-  kinsolMemory = KINCreate(ctx);
-#else
-  kinsolMemory = KINCreate();
-#endif
-
-  if (!checkAllocation(kinsolMemory, "KINCreate")) {
-    return false;
+  realtype effectiveMaximumNewtonStep =
+      maximumNewtonStep.value_or(getOptions().maxNewtonStep);
+  if (effectiveMaximumNewtonStep <= 0) {
+    effectiveMaximumNewtonStep = std::max<realtype>(
+        100, 10 * std::sqrt(static_cast<realtype>(scalarVariablesNumber)));
   }
-
-  if (!kinsolInit()) {
-    return false;
-  }
-
-  if (!kinsolMaxNewtonStep()) {
-    return false;
-  }
-
-  // Create sparse SUNMatrix for use in linear solver.
-#if SUNDIALS_VERSION_MAJOR >= 6
-  sparseMatrix = SUNSparseMatrix(
-      static_cast<sunindextype>(scalarEquationsNumber),
-      static_cast<sunindextype>(scalarEquationsNumber),
-      static_cast<sunindextype>(nonZeroValuesNumber), CSR_MAT, ctx);
-#else
-  sparseMatrix =
-      SUNSparseMatrix(static_cast<sunindextype>(scalarEquationsNumber),
-                      static_cast<sunindextype>(scalarEquationsNumber),
-                      static_cast<sunindextype>(nonZeroValuesNumber), CSR_MAT);
-#endif
-
-  if (!checkAllocation(static_cast<void *>(sparseMatrix), "SUNSparseMatrix")) {
-    return false;
-  }
-
-  // Create and attach a KLU SUNLinearSolver object.
-#if SUNDIALS_VERSION_MAJOR >= 6
-  linearSolver = SUNLinSol_KLU(variablesVector, sparseMatrix, ctx);
-#else
-  linearSolver = SUNLinSol_KLU(variablesVector, sparseMatrix);
-#endif
-
-  if (!checkAllocation(static_cast<void *>(linearSolver), "SUNLinSol_KLU")) {
-    return false;
-  }
-
-  if (!kinsolSetLinearSolver()) {
-    return false;
-  }
-
-  if (!kinsolSetUserData() || !kinsolSetJacobianFunction()) {
+  // 中文：KINSOLInstance 与 constraint-local solve 共享同一个稀疏非线性内核，
+  // 因而 scaling、recoverable failure 与 KLU 行为保持一致。
+  // English: KINSOLInstance and constraint-local solves share one sparse
+  // nonlinear core, keeping scaling, recoverable failure, and KLU semantics
+  // consistent.
+  SparseNonlinearSystem::Configuration configuration{
+      scalarVariablesNumber,
+      nonZeroValuesNumber,
+      functionNormTolerance.value_or(getOptions().fnormtol),
+      scaledStepTolerance.value_or(getOptions().scsteptol),
+      effectiveMaximumNewtonStep,
+      lineSearchEnabled,
+      quietErrors};
+  nonlinearSystem = std::make_unique<SparseNonlinearSystem>(
+      configuration,
+      [this](N_Vector variables, N_Vector residuals) {
+        return residualFunction(variables, residuals, this);
+      },
+      [this](N_Vector variables, N_Vector residuals, SUNMatrix jacobian) {
+        return jacobianMatrix(variables, residuals, jacobian, this, nullptr,
+                              nullptr);
+      });
+  if (!nonlinearSystem->initialize()) {
     return false;
   }
 
@@ -540,9 +506,18 @@ bool KINSOLInstance::initialize() {
 }
 
 bool KINSOLInstance::solve() {
+  return solveWithStatus(currentTime) == SolveStatus::Success;
+}
+
+KINSOLInstance::SolveStatus KINSOLInstance::solveWithStatus(realtype time) {
+  // 中文：facade 负责 MARCO 数组与 solver vector 的双向同步；失败时绝不把
+  // 未收敛的 trial values 写回模型数组。
+  // English: The facade synchronizes MARCO arrays with the solver vector and
+  // never writes unconverged trial values back to model storage on failure.
+  currentTime = time;
   if (!initialized) {
     if (!initialize()) {
-      return false;
+      return SolveStatus::FatalFailure;
     }
   }
 
@@ -551,24 +526,163 @@ bool KINSOLInstance::solve() {
   }
 
   if (getNumOfScalarEquations() == 0) {
-    // KINSOL has nothing to solve.
+    return SolveStatus::Success;
+  }
+
+  N_Vector variables = nonlinearSystem->getVariablesVector();
+  copyVariablesFromMARCO(variables);
+  nonlinearSystem->setLineSearchEnabled(lineSearchEnabled);
+  SparseNonlinearSystem::SolveStatus status = nonlinearSystem->solve(time);
+  if (status != SparseNonlinearSystem::SolveStatus::Success) {
+    return status == SparseNonlinearSystem::SolveStatus::RecoverableFailure
+               ? SolveStatus::RecoverableFailure
+               : SolveStatus::FatalFailure;
+  }
+  copyVariablesIntoMARCO(variables);
+  return SolveStatus::Success;
+}
+
+bool KINSOLInstance::solve(realtype time) {
+  return solveWithStatus(time) == SolveStatus::Success;
+}
+
+bool KINSOLInstance::solve(realtype time, bool enableLineSearch) {
+  lineSearchEnabled = enableLineSearch;
+  return solveWithStatus(time) == SolveStatus::Success;
+}
+
+void KINSOLInstance::setFunctionNormTolerance(realtype tolerance) {
+  assert(!initialized && "KINSOL tolerance must be set before initialize");
+  functionNormTolerance = tolerance;
+}
+
+void KINSOLInstance::setScaledStepTolerance(realtype tolerance) {
+  assert(!initialized && "KINSOL tolerance must be set before initialize");
+  scaledStepTolerance = tolerance;
+}
+
+void KINSOLInstance::setMaximumNewtonStep(realtype maximumStep) {
+  assert(!initialized && "KINSOL maximum step must be set before initialize");
+  maximumNewtonStep = maximumStep;
+}
+
+void KINSOLInstance::setLineSearchEnabled(bool enabled) {
+  assert(!initialized && "KINSOL strategy must be set before initialize");
+  lineSearchEnabled = enabled;
+}
+
+void KINSOLInstance::setQuietErrors(bool enabled) {
+  assert(!initialized && "KINSOL error handling must be set before initialize");
+  quietErrors = enabled;
+}
+
+bool KINSOLInstance::configureInitializationAnchorScaling(realtype time) {
+  // 中文：scaling 锚定在初始化成功点；显式 nominal 优先，缺失时才用固定的
+  // max(1, |z0|)，不会随 Newton 试探点漂移。
+  // English: Scaling is anchored at the initialized state. Explicit nominals
+  // take precedence and missing values use fixed max(1, |z0|), never a scale
+  // that changes with Newton trial points.
+  if (initializationAnchorScalingConfigured) {
     return true;
   }
-
-  // Update the values of the variables living inside KINSOL.
-  copyVariablesFromMARCO(variablesVector);
-
-  auto solveRetVal = KINSol(kinsolMemory, variablesVector, KIN_LINESEARCH,
-                            variableScaleVector, residualScaleVector);
-
-  if (solveRetVal != KIN_SUCCESS) {
-    // TODO handle errors
+  if (!initialized && !initialize()) {
     return false;
   }
-
-  copyVariablesIntoMARCO(variablesVector);
-
+  if (getNumOfScalarEquations() == 0) {
+    initializationAnchorScalingConfigured = true;
+    return true;
+  }
+  N_Vector variables = nonlinearSystem->getVariablesVector();
+  copyVariablesFromMARCO(variables);
+  if (!nonlinearSystem->factorize(time)) {
+    return false;
+  }
+  std::vector<double> variableNominals(scalarVariablesNumber, 1);
+  explicitNominalScalars = 0;
+  anchorNominalScalars = 0;
+  for (Variable variable = 0; variable < getNumOfArrayVariables();
+       ++variable) {
+    const VariableDimensions &dimensions = variablesDimensions[variable];
+    std::vector<uint64_t> indices;
+    getVariableBeginIndices(variable, indices);
+    uint64_t flat = 0;
+    do {
+      double nominal = 0;
+      if (variableNominalGetters[variable] != nullptr) {
+        nominal = variableNominalGetters[variable](indices.data());
+        ++explicitNominalScalars;
+      } else {
+        nominal = std::max(
+            1.0, std::abs(variableGetters[variable](indices.data())));
+        ++anchorNominalScalars;
+      }
+      if (!(nominal > 0) || !std::isfinite(nominal)) {
+        return false;
+      }
+      variableNominals[variableOffsets[variable] + flat++] = nominal;
+    } while (advanceVariableIndices(indices, dimensions));
+  }
+  if (explicitNominalScalars + anchorNominalScalars !=
+      scalarVariablesNumber) {
+    return false;
+  }
+  if (!nonlinearSystem->setScalingFromVariableNominals(variableNominals)) {
+    return false;
+  }
+  initializationAnchorScalingConfigured = true;
   return true;
+}
+
+bool KINSOLInstance::factorizeCurrentJacobian(realtype time) {
+  // 中文：Schur/condition 查询总是在当前 MARCO 数组值上刷新一次 Jacobian，
+  // 随后的多个 RHS 共享该分解直到下一次显式 factorize。
+  // English: Schur and condition queries refresh the Jacobian from current
+  // MARCO arrays once; subsequent right-hand sides share that factorization
+  // until the next explicit factorize call.
+  currentTime = time;
+  if (!initialized && !initialize()) {
+    return false;
+  }
+  if (getNumOfScalarEquations() == 0) {
+    return true;
+  }
+  copyVariablesFromMARCO(nonlinearSystem->getVariablesVector());
+  return nonlinearSystem->factorize(time);
+}
+
+bool KINSOLInstance::solveCurrentJacobian(
+    const std::vector<double> &rhs, std::vector<double> &solution) {
+  return nonlinearSystem != nullptr &&
+         nonlinearSystem->solveFactorized(rhs, solution);
+}
+
+bool KINSOLInstance::getCurrentJacobianEntries(
+    const std::vector<uint64_t> &rows,
+    const std::vector<uint64_t> &columns,
+    std::vector<double> &values) const {
+  return nonlinearSystem != nullptr &&
+         nonlinearSystem->extractEntries(rows, columns, values);
+}
+
+bool KINSOLInstance::estimateScaledJacobianCondition(
+    const std::vector<uint64_t> &rows,
+    const std::vector<uint64_t> &columns,
+    SparseNonlinearSystem::ConditionEstimate &estimate) const {
+  return nonlinearSystem != nullptr &&
+         nonlinearSystem->estimateScaledSubmatrixCondition(rows, columns,
+                                                            estimate);
+}
+
+double KINSOLInstance::getScalarVariableNominal(uint64_t scalarIndex) const {
+  return nonlinearSystem == nullptr
+             ? 0
+             : nonlinearSystem->getVariableNominal(scalarIndex);
+}
+
+uint64_t KINSOLInstance::getLastNonlinearIterations() const {
+  return nonlinearSystem == nullptr
+             ? 0
+             : nonlinearSystem->getLastNonlinearIterations();
 }
 
 int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
@@ -600,12 +714,36 @@ int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
 
         uint64_t offset = equationArrayOffset + equationScalarOffset;
 
-        auto residualFn = instance->residualFunctions[eq];
+        // 中文：timed callback 专供 IDA component closure；普通 KINSOL 路径仍
+        // 使用无时间签名，两者共享相同 residual buffer 和有限值检查。
+        // English: Timed callbacks serve IDA component closure while ordinary
+        // KINSOL retains the time-independent signature. Both share the same
+        // residual buffer and finite-value validation.
+        auto residualFn = eq < instance->residualFunctions.size()
+                              ? instance->residualFunctions[eq]
+                              : nullptr;
+        auto timedResidualFn = eq < instance->timedResidualFunctions.size()
+                                   ? instance->timedResidualFunctions[eq]
+                                   : nullptr;
         auto *eqIndicesPtr = equationIndices.data();
 
-        auto residualFunctionResult = residualFn(eqIndicesPtr);
+        auto residualFunctionResult =
+            timedResidualFn != nullptr
+                ? timedResidualFn(instance->currentTime, eqIndicesPtr)
+                : residualFn(eqIndicesPtr);
         *(rval + offset) = residualFunctionResult;
       });
+
+  if (instance->timedResidualPostprocessor &&
+      !instance->timedResidualPostprocessor(instance->currentTime, rval,
+                                            instance->scalarEquationsNumber)) {
+    return KIN_SYSFUNC_FAIL;
+  }
+  for (uint64_t i = 0; i < instance->scalarEquationsNumber; ++i) {
+    if (!std::isfinite(rval[i])) {
+      return KIN_SYSFUNC_FAIL;
+    }
+  }
 
   KINSOL_PROFILER_RESIDUALS_STOP
 
@@ -666,19 +804,43 @@ int KINSOLInstance::jacobianMatrix(N_Vector variables, N_Vector residuals,
               instance->variablesDimensions[variable], column.second);
 
           auto jacobianFunction =
-              instance->jacobianFunctions[eq][variable].first;
+              eq < instance->jacobianFunctions.size() &&
+                      variable < instance->jacobianFunctions[eq].size()
+                  ? instance->jacobianFunctions[eq][variable].first
+                  : nullptr;
+          auto timedJacobianFunction =
+              eq < instance->timedJacobianFunctions.size() &&
+                      variable < instance->timedJacobianFunctions[eq].size()
+                  ? instance->timedJacobianFunctions[eq][variable].first
+                  : nullptr;
 
-          assert(jacobianFunction != nullptr);
-          auto seedsMapIt = jacobianSeedsMap.find(jacobianFunction);
+          // 中文：timed-only Jacobian 是合法配置，seed cache 以实际 callback
+          // 地址区分，不能再断言普通 callback 必须存在。
+          // English: A timed-only Jacobian is valid. The seed cache keys the
+          // actual callback address and must not require an ordinary callback.
+          assert((jacobianFunction != nullptr ||
+                  timedJacobianFunction != nullptr) &&
+                 "Missing Jacobian callback");
+          uintptr_t seedKey = jacobianFunction != nullptr
+                                  ? reinterpret_cast<uintptr_t>(
+                                        jacobianFunction)
+                                  : reinterpret_cast<uintptr_t>(
+                                        timedJacobianFunction);
+          auto seedsMapIt = jacobianSeedsMap.find(seedKey);
           const uint64_t *seedsPtr = nullptr;
 
           if (seedsMapIt != jacobianSeedsMap.end()) {
             seedsPtr = seedsMapIt->second.data();
           }
 
-          auto jacobianFunctionResult =
-              jacobianFunction(equationIndices.data(), variableIndices.data(),
-                               instance->memoryPoolId, seedsPtr);
+          auto jacobianFunctionResult = timedJacobianFunction != nullptr
+              ? timedJacobianFunction(
+                    instance->currentTime, equationIndices.data(),
+                    variableIndices.data(), 0.0, instance->memoryPoolId,
+                    seedsPtr)
+              : jacobianFunction(equationIndices.data(),
+                                 variableIndices.data(),
+                                 instance->memoryPoolId, seedsPtr);
 
           instance->jacobianMatrixData[scalarEquationIndex][i].second =
               jacobianFunctionResult;
@@ -702,6 +864,14 @@ int KINSOLInstance::jacobianMatrix(N_Vector variables, N_Vector residuals,
     *rowPtrs++ = offset;
 
     for (const auto &column : row) {
+      // 中文：AD callback 的非有限值是结构/数值函数失败，必须在写入 SUNMatrix 时
+      // 立即上报，不能让 KLU 接收污染矩阵后给出误导性收敛错误。
+      // English: A non-finite AD callback value is a structural/numerical
+      // function failure and is reported before KLU receives a contaminated
+      // matrix and emits a misleading convergence error.
+      if (!std::isfinite(column.second)) {
+        return KIN_SYSFUNC_FAIL;
+      }
       *columnIndices++ = column.first;
       *jacobian++ = column.second;
     }
@@ -937,11 +1107,29 @@ void KINSOLInstance::computeThreadChunks() {
 
       JacobianSeedsMap jacobianSeedsMap;
 
+      // 中文：普通和 timed Jacobian 共享 chunk-local AD seed pool，但键必须是
+      // 实际被调用的函数地址，避免 timed-only 方程错误复用空键。
+      // English: Ordinary and timed Jacobians share the chunk-local AD seed
+      // pool, keyed by the callback that will actually run so timed-only
+      // equations cannot alias a null key.
       iterateAccessedArrayVariables(equation, [&](Variable variable) {
-        auto jacobianFunction = jacobianFunctions[equation][variable].first;
-        const auto &seedSizes = jacobianFunctions[equation][variable].second;
+        uintptr_t jacobianFunction = 0;
+        const std::vector<uint64_t> *seedSizes = nullptr;
+        if (equation < jacobianFunctions.size() &&
+            variable < jacobianFunctions[equation].size() &&
+            jacobianFunctions[equation][variable].first != nullptr) {
+          jacobianFunction = reinterpret_cast<uintptr_t>(
+              jacobianFunctions[equation][variable].first);
+          seedSizes = &jacobianFunctions[equation][variable].second;
+        } else if (equation < timedJacobianFunctions.size() &&
+                   variable < timedJacobianFunctions[equation].size()) {
+          jacobianFunction = reinterpret_cast<uintptr_t>(
+              timedJacobianFunctions[equation][variable].first);
+          seedSizes = &timedJacobianFunctions[equation][variable].second;
+        }
+        assert(jacobianFunction != 0 && seedSizes != nullptr);
 
-        for (const auto &seedSize : seedSizes) {
+        for (const auto &seedSize : *seedSizes) {
           MemoryPool &memoryPool =
               MemoryPoolManager::getInstance().get(memoryPoolId);
           uint64_t seedId = memoryPool.create(seedSize);
@@ -1161,159 +1349,6 @@ void KINSOLInstance::getEquationEndIndices(
   }
 }
 
-bool KINSOLInstance::kinsolInit() {
-  auto retVal = KINInit(kinsolMemory, residualFunction, variablesVector);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINInit - The kinsol_mem pointer is NULL" << std::endl;
-    return false;
-  }
-
-  if (retVal == KIN_MEM_FAIL) {
-    std::cerr << "KINInit - A memory allocation request has failed"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KIN_ILL_INPUT) {
-    std::cerr << "KINInit - An input argument to KINInit has an illegal value"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolFNTolerance() {
-  auto retVal = KINSetFuncNormTol(kinsolMemory, getOptions().fnormtol);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINSVtolerances - The kinsol_mem pointer is NULL"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KIN_ILL_INPUT) {
-    std::cerr << "KINSVtolerances - The relative error tolerance was negative "
-                 "or the absolute tolerance vector had a negative component"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolSSTolerance() {
-  auto retVal = KINSetScaledStepTol(kinsolMemory, getOptions().scsteptol);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINSVtolerances - The kinsol_mem pointer is NULL"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KIN_ILL_INPUT) {
-    std::cerr << "KINSVtolerances - The relative error tolerance was negative "
-                 "or the absolute tolerance vector had a negative component"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolMaxNewtonStep() {
-  realtype maxNewtonStep = getOptions().maxNewtonStep;
-
-  if (maxNewtonStep <= 0) {
-    // 中文：max Newton step 是缩放后的向量范数限制。对数组代数块，即使
-    // 每个分量只需移动 O(1)，整体范数也会随 sqrt(N) 增长。
-    // English: The maximum Newton step limits the scaled vector norm. For array
-    // algebraic blocks, even O(1) movement per component makes the total norm
-    // grow with sqrt(N).
-    maxNewtonStep = std::max<realtype>(
-        100, 10 * std::sqrt(static_cast<realtype>(scalarVariablesNumber)));
-  }
-
-  auto retVal = KINSetMaxNewtonStep(kinsolMemory, maxNewtonStep);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINSetMaxNewtonStep - The kinsol_mem pointer is NULL"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KIN_ILL_INPUT) {
-    std::cerr << "KINSetMaxNewtonStep - The maximum Newton step is not "
-                 "positive"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolSetLinearSolver() {
-  auto retVal = KINSetLinearSolver(kinsolMemory, linearSolver, sparseMatrix);
-
-  if (retVal == KINLS_MEM_NULL) {
-    std::cerr << "KINSetLinearSolver - The kinsol_mem pointer is NULL"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KINLS_ILL_INPUT) {
-    std::cerr << "KINSetLinearSolver - The KINLS interface is not compatible "
-                 "with the LS or J input objects or is incompatible with the "
-                 "N_Vector object passed to KINInit"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KINLS_SUNLS_FAIL) {
-    std::cerr << "KINSetLinearSolver - A call to the LS object failed"
-              << std::endl;
-    return false;
-  }
-
-  if (retVal == KINLS_MEM_FAIL) {
-    std::cerr << "KINSetLinearSolver - A memory allocation request failed"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KINLS_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolSetUserData() {
-  auto retVal = KINSetUserData(kinsolMemory, this);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINSetUserData - The kinsol_mem pointer is NULL" << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
-bool KINSOLInstance::kinsolSetJacobianFunction() {
-  auto retVal = KINSetJacFn(kinsolMemory, jacobianMatrix);
-
-  if (retVal == KIN_MEM_NULL) {
-    std::cerr << "KINSetJacFn - The kinsol_mem pointer is NULL" << std::endl;
-    return false;
-  }
-
-  if (retVal == KINLS_LMEM_NULL) {
-    std::cerr << "KINSetJacFn - The KINLS linear solver interface has not been "
-                 "initialized"
-              << std::endl;
-    return false;
-  }
-
-  return retVal == KIN_SUCCESS;
-}
-
 void KINSOLInstance::printVariablesVector(N_Vector variables) const {
   realtype *data = N_VGetArrayPointer(variables);
   uint64_t numOfArrayVariables = getNumOfArrayVariables();
@@ -1424,9 +1459,15 @@ RUNTIME_FUNC_DEF(kinsolCreate, PTR(void))
 // kinsolSolve
 
 static void kinsolSolve_void(void *instance) {
-  [[maybe_unused]] bool result =
-      static_cast<KINSOLInstance *>(instance)->solve();
-  assert(result && "KINSOL solve failed");
+  // 中文：生成程序中的数值失败必须在 release 构建中传播为非零退出，不能依赖
+  // 会被 NDEBUG 移除的 assert。
+  // English: Numerical failure in generated programs must propagate as a
+  // non-zero release exit and cannot rely on an assertion removed by NDEBUG.
+  bool result = static_cast<KINSOLInstance *>(instance)->solve();
+  if (!result) {
+    std::cerr << "KINSOL solve failed." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 RUNTIME_FUNC_DEF(kinsolSolve, void, PTR(void))

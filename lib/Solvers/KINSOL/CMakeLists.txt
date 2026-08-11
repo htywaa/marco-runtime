@@ -21,8 +21,11 @@ target_link_libraries(OptionsKINSOL_static
 
 # Solver libraries.
 set(SOLVER_SRC
+    # 中文：共享内核同时服务普通 KINSOL 与 IDA component-local 闭包。
+    # English: The shared core serves both ordinary KINSOL and IDA component-local closure.
     Instance.cpp
-    Profiler.cpp)
+    Profiler.cpp
+    SparseNonlinearSystem.cpp)
 
 marco_add_runtime_shared_library(SolverKINSOL
     ${SOLVER_SRC})

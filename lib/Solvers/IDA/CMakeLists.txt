@@ -55,14 +55,20 @@ set(SOLVER_LINKED_LIBS
     Support)
 
 target_link_libraries(SolverIDA
+    # 中文：IDA 动态目标复用共享 sparse nonlinear component solver。
+    # English: The dynamic IDA target reuses the shared sparse nonlinear component solver.
     PUBLIC
     ${SOLVER_LINKED_LIBS}
-    OptionsSimulation)
+    OptionsSimulation
+    SolverKINSOL)
 
 target_link_libraries(SolverIDA_static
+    # 中文：静态目标保持与动态目标相同的局部闭包依赖。
+    # English: The static target preserves the same local-closure dependency.
     PUBLIC
     ${SOLVER_LINKED_LIBS}
-    OptionsSimulation_static)
+    OptionsSimulation_static
+    SolverKINSOL_static)
 
 if (MARCO_PROFILING)
     target_link_libraries(SolverIDA

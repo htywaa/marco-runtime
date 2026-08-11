@@ -4,6 +4,7 @@
 #ifdef SUNDIALS_ENABLE
 
 #include "ida/ida.h"
+#include <optional>
 
 #if SUNDIALS_VERSION_MAJOR >= 7
 #include "sundials/sundials_types_deprecated.h"
@@ -64,8 +65,10 @@ struct Options {
   // Maximum number of error test failures in attempting one step
   int maxErrTestFails = 10;
 
-  // Whether to suppress algebraic variables in the local error test
-  booleantype suppressAlg = SUNFALSE;
+  // 中文：显式 CLI 覆盖 algebraic local-error-test 策略；未设置时采用模型默认值。
+  // English: Explicit CLI override for whether algebraic variables participate
+  // in the local error test. If unset, the model-level default wins.
+  std::optional<booleantype> suppressAlgOverride;
 
   // Maximum number of nonlinear solver iterations in one solve attempt
   int maxNonlinIters = 4;

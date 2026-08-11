@@ -4,17 +4,22 @@
 #ifdef SUNDIALS_ENABLE
 
 #include "kinsol/kinsol.h"
+#include "marco/Runtime/Solvers/KINSOL/SparseNonlinearSystem.h"
 #include "marco/Runtime/Solvers/SUNDIALS/Instance.h"
 #include "nvector/nvector_serial.h"
 #include "sundials/sundials_config.h"
 #include "sundials/sundials_types.h"
 #include "sunlinsol/sunlinsol_klu.h"
 #include "sunmatrix/sunmatrix_sparse.h"
+#include <functional>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
 namespace marco::runtime::sundials::kinsol {
+
 /// Signature of residual functions.
 /// The 1st argument is a pointer to the list of equation indices.
 /// The result is the residual value.
@@ -30,6 +35,18 @@ using ResidualFunction = double (*)(const int64_t *);
 using JacobianFunction = double (*)(const int64_t *, const uint64_t *, uint64_t,
                                     const uint64_t *);
 
+/// 中文：带时间 callback 是 IDA component-local 闭包的适配层；普通 KINSOL
+/// 仍使用无时间签名。postprocessor 在返回 residual 前刷新依赖 execution group。
+/// English: Time-aware callbacks adapt IDA component-local closures while
+/// ordinary KINSOL keeps its time-independent ABI. The postprocessor refreshes
+/// dependent execution groups before residuals are returned.
+using TimedResidualFunction = double (*)(double, const int64_t *);
+using TimedJacobianFunction = double (*)(double, const int64_t *,
+                                         const uint64_t *, double, uint64_t,
+                                         const uint64_t *);
+using TimedResidualPostprocessor =
+    std::function<bool(double, double *, uint64_t)>;
+
 /// A descriptor of a Jacobian function is a pair of value consisting in:
 ///  - the function pointer
 ///  - the number of elements of each AD seed
@@ -38,7 +55,7 @@ using JacobianFunctionDescriptor =
 
 /// A map indicating the IDs of the buffers living inside the memory pool to
 /// be used as AD seeds for each Jacobian function.
-using JacobianSeedsMap = std::map<JacobianFunction, std::vector<uint64_t>>;
+using JacobianSeedsMap = std::map<uintptr_t, std::vector<uint64_t>>;
 
 /// A chunk of equations to be processed by a thread while computing the
 /// residual values or partial derivatives.
@@ -55,6 +72,13 @@ enum class EquationsParallelIterationKind { Residuals, Jacobian };
 
 class KINSOLInstance {
 public:
+  /// 中文：RecoverableFailure 仅表示当前 IDA 试探点不可解；FatalFailure 表示
+  /// callback、结构或资源错误，调用者不得继续缩步掩盖。
+  /// English: RecoverableFailure means only the current IDA trial point could
+  /// not be solved; FatalFailure denotes callback, structural, or resource
+  /// errors that must not be hidden by step-size retries.
+  enum class SolveStatus { Success, RecoverableFailure, FatalFailure };
+
   KINSOLInstance();
 
   ~KINSOLInstance();
@@ -62,6 +86,9 @@ public:
   Variable addVariable(uint64_t rank, const uint64_t *dimensions,
                        VariableGetter getterFunction,
                        VariableSetter setterFunction, const char *name);
+
+  bool setVariableNominalGetter(Variable variable,
+                                VariableGetter nominalGetter);
 
   /// Add the information about an equation that is handled by KINSOL.
   Equation addEquation(const int64_t *ranges, uint64_t rank,
@@ -75,11 +102,20 @@ public:
   void setResidualFunction(Equation equationIndex,
                            ResidualFunction residualFunction);
 
+  void setTimedResidualFunction(Equation equationIndex,
+                                TimedResidualFunction residualFunction);
+
+  void setTimedResidualPostprocessor(TimedResidualPostprocessor callback);
+
   /// Add the function pointer that computes a partial derivative of an
   /// equation.
   void addJacobianFunction(Equation equationIndex, Variable variableIndex,
                            JacobianFunction jacobianFunction,
                            uint64_t numOfSeeds, uint64_t *seedSizes);
+
+  void addTimedJacobianFunction(Equation equationIndex, Variable variableIndex,
+                                TimedJacobianFunction jacobianFunction,
+                                uint64_t numOfSeeds, uint64_t *seedSizes);
 
   /// Instantiate and initialize all the classes needed by KINSOL in order to
   /// solve the given system of equations. It also sets optional simulation
@@ -87,6 +123,53 @@ public:
   bool initialize();
 
   bool solve();
+
+  bool solve(realtype time);
+
+  bool solve(realtype time, bool enableLineSearch);
+
+  SolveStatus solveWithStatus(realtype time);
+
+  void setFunctionNormTolerance(realtype tolerance);
+
+  void setScaledStepTolerance(realtype tolerance);
+
+  void setMaximumNewtonStep(realtype maximumStep);
+
+  void setLineSearchEnabled(bool enabled);
+
+  void setQuietErrors(bool enabled);
+
+  bool configureInitializationAnchorScaling(realtype time);
+
+  /// 中文：以下接口复用当前 sparse Jacobian factorization，供 Schur 补、
+  /// condition 证书和多 RHS sensitivity 求解使用。
+  /// English: The following APIs reuse the current sparse Jacobian
+  /// factorization for Schur complements, condition certificates, and
+  /// multiple sensitivity right-hand sides.
+  bool factorizeCurrentJacobian(realtype time);
+
+  bool solveCurrentJacobian(const std::vector<double> &rhs,
+                            std::vector<double> &solution);
+
+  bool getCurrentJacobianEntries(const std::vector<uint64_t> &rows,
+                                 const std::vector<uint64_t> &columns,
+                                 std::vector<double> &values) const;
+
+  bool estimateScaledJacobianCondition(
+      const std::vector<uint64_t> &rows,
+      const std::vector<uint64_t> &columns,
+      SparseNonlinearSystem::ConditionEstimate &estimate) const;
+
+  double getScalarVariableNominal(uint64_t scalarIndex) const;
+
+  uint64_t getLastNonlinearIterations() const;
+
+  uint64_t getExplicitNominalScalars() const {
+    return explicitNominalScalars;
+  }
+
+  uint64_t getAnchorNominalScalars() const { return anchorNominalScalars; }
 
   /// KINSOLResFn user-defined residual function, passed to KINSOL through
   /// KINSOLInit. It contains how to compute the Residual Function of the
@@ -154,18 +237,6 @@ private:
                              std::vector<int64_t> &indices) const;
 
 private:
-  /// @name Forwarded methods
-  /// {
-
-  bool kinsolInit();
-  bool kinsolFNTolerance();
-  bool kinsolSSTolerance();
-  bool kinsolMaxNewtonStep();
-  bool kinsolSetLinearSolver();
-  bool kinsolSetUserData();
-  bool kinsolSetJacobianFunction();
-
-  /// }
   /// @name Debug functions
   /// {
   void printVariablesVector(N_Vector variables) const;
@@ -177,15 +248,6 @@ private:
   /// }
 
 private:
-#if SUNDIALS_VERSION_MAJOR >= 7
-  SUNComm comm{0};
-#endif
-
-#if SUNDIALS_VERSION_MAJOR >= 6
-  // SUNDIALS context.
-  SUNContext ctx{nullptr};
-#endif
-
   // Whether the instance has been inizialized or not.
   bool initialized{false};
 
@@ -200,13 +262,36 @@ private:
   // The residual functions associated with the equations.
   // The i-th position contains the pointer to the residual function of the
   // i-th equation.
+  /// 中文：普通与 timed callback 使用平行描述表；每个 equation 至少拥有一种，
+  /// 但不要求为了 timed-only component 伪造普通 callback。
+  /// English: Ordinary and timed callbacks use parallel descriptor tables.
+  /// Every equation owns at least one form, without fabricating an ordinary
+  /// callback for timed-only components.
   std::vector<ResidualFunction> residualFunctions;
+  std::vector<TimedResidualFunction> timedResidualFunctions;
+  TimedResidualPostprocessor timedResidualPostprocessor;
 
   // The jacobian functions associated with the equations.
   // The i-th position contains the list of partial derivative functions of
   // the i-th equation. The j-th function represents the function to
   // compute the derivative with respect to the j-th variable.
   std::vector<std::vector<JacobianFunctionDescriptor>> jacobianFunctions;
+  std::vector<std::vector<
+      std::pair<TimedJacobianFunction, std::vector<uint64_t>>>>
+      timedJacobianFunctions;
+
+  /// 中文：这些覆盖项在 initialize 前冻结，使普通 KINSOL 与 IDA 局部闭包
+  /// 可共享实现而保持实例级数值策略隔离。
+  /// English: These overrides are frozen before initialization, allowing
+  /// ordinary KINSOL and IDA local closures to share implementation while
+  /// keeping numerical policy instance-local.
+  realtype currentTime{0};
+  std::optional<realtype> functionNormTolerance;
+  std::optional<realtype> scaledStepTolerance;
+  std::optional<realtype> maximumNewtonStep;
+  bool lineSearchEnabled{true};
+  bool quietErrors{false};
+  bool initializationAnchorScalingConfigured{false};
 
   // Whether the IDA instance is informed about the accesses to the
   // variables.
@@ -225,20 +310,6 @@ private:
   // vector.
   std::vector<uint64_t> equationOffsets;
 
-  // Variables vectors and values.
-  N_Vector variablesVector;
-
-  // The tolerance for each scalar variable.
-  N_Vector tolerancesVector;
-
-  N_Vector variableScaleVector;
-  N_Vector residualScaleVector;
-
-  // KINSOL classes.
-  void *kinsolMemory;
-
-  SUNMatrix sparseMatrix;
-
   // Support structure for the computation of the jacobian matrix.
   // The outer vector has a number of elements equal to the scalar number
   // of equations. Each of them represents a row of the matrix and consists
@@ -248,10 +319,20 @@ private:
   // value of the partial derivative.
   std::vector<std::vector<std::pair<sunindextype, double>>> jacobianMatrixData;
 
-  SUNLinearSolver linearSolver;
+  /// 中文：底层 SUNDIALS vectors、KLU 与 scaling 的所有权集中在共享内核；
+  /// facade 只维护 MARCO 数组布局、callback 与稀疏列描述。
+  /// English: The shared kernel owns SUNDIALS vectors, KLU, and scaling; this
+  /// facade retains MARCO array layout, callbacks, and sparse-column metadata.
+  std::unique_ptr<SparseNonlinearSystem> nonlinearSystem;
 
   std::vector<VariableGetter> variableGetters;
   std::vector<VariableSetter> variableSetters;
+  /// 中文：显式 nominal 与初始化值锚点分开计数，runtime probe 可审计实际尺度来源。
+  /// English: Explicit nominals and initialization-value anchors are counted
+  /// separately so runtime probes can audit the actual scale source.
+  std::vector<VariableGetter> variableNominalGetters;
+  uint64_t explicitNominalScalars{0};
+  uint64_t anchorNominalScalars{0};
 
   // Thread pool.
   ThreadPool threadPool;

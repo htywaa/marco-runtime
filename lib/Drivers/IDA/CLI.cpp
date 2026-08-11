@@ -3,6 +3,7 @@
 
 #include "marco/Runtime/Drivers/IDA/CLI.h"
 #include "marco/Runtime/Solvers/IDA/Options.h"
+#include <cstdlib>
 #include <iostream>
 
 namespace marco::runtime::sundials::ida {
@@ -24,7 +25,11 @@ void CommandLineOptions::printCommandLineOptions(std::ostream &os) const {
   os << "  --ida-min-step-size=<value>            Set the minimum absolute value of the step size. Defaults to " << getOptions().minStepSize << "." << std::endl;
   os << "  --ida-max-step-size=<value>            Set the maximum absolute value of the step size. Defaults to " << getOptions().maxStepSize << "." << std::endl;
   os << "  --ida-max-err-test-fails=<value>       Set the maximum number of error test failures in attempting one step. Defaults to " << getOptions().maxErrTestFails << "." << std::endl;
+  // 中文：成对展示正反 override，明确用户可覆盖 dummy-state 模型默认策略。
+  // English: Show both override directions so users can explicitly replace a
+  // dummy-state model's default policy.
   os << "  --ida-suppress-alg-vars                Suppress algebraic variables in the local error test." << std::endl;
+  os << "  --ida-include-alg-vars                 Include algebraic variables in the local error test, overriding a model default." << std::endl;
   os << "  --ida-max-nonlin-iters=<value>         Maximum number of nonlinear solver iterations in one solve attempt. Defaults to " << getOptions().maxNonlinIters << "." << std::endl;
   os << "  --ida-max-conv-fails=<value>           Maximum number of nonlinear solver convergence failures in one step. Defaults to " << getOptions().maxConvFails << "." << std::endl;
   os << "  --ida-nonlin-conv-coef=<value>         Safety factor in the nonlinear convergence test. Defaults to " << getOptions().nonlinConvCoef << "." << std::endl;
@@ -52,7 +57,25 @@ void CommandLineOptions::parseCommandLineOptions(
   options("ida-min-step-size", getOptions().minStepSize) >> getOptions().minStepSize;
   options("ida-max-step-size", getOptions().maxStepSize) >> getOptions().maxStepSize;
   options("ida-max-err-test-fails", getOptions().maxErrTestFails) >> getOptions().maxErrTestFails;
-  getOptions().suppressAlg = options["ida-suppress-alg-vars"] ? SUNTRUE : SUNFALSE;
+  // 中文：CLI 显式值优先于模型默认；正反开关互斥，避免无法追踪的顺序覆盖。
+  // English: An explicit CLI choice overrides the model default. The positive
+  // and negative switches are mutually exclusive to avoid order-dependent
+  // behavior.
+  bool suppressAlgebraic = options["ida-suppress-alg-vars"];
+  bool includeAlgebraic = options["ida-include-alg-vars"];
+  if (suppressAlgebraic && includeAlgebraic) {
+    std::cerr << "Conflicting IDA options: --ida-suppress-alg-vars and "
+                 "--ida-include-alg-vars cannot be used together."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  if (suppressAlgebraic) {
+    getOptions().suppressAlgOverride = SUNTRUE;
+  } else if (includeAlgebraic) {
+    getOptions().suppressAlgOverride = SUNFALSE;
+  } else {
+    getOptions().suppressAlgOverride.reset();
+  }
   options("ida-max-nonlin-iters", getOptions().maxNonlinIters) >> getOptions().maxNonlinIters;
   options("ida-max-conv-fails", getOptions().maxConvFails) >> getOptions().maxConvFails;
   options("ida-nonlin-conv-coef", getOptions().nonlinConvCoef) >> getOptions().nonlinConvCoef;
