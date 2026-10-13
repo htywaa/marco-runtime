@@ -103,6 +103,12 @@ struct Options {
   // In other words, it is the amount of chunks each thread would process in
   // a perfectly balanced scenario.
   int64_t equationsChunksFactor = 10;
+
+  // 中文：新增字段追加在末尾，保持已有生成 driver 使用的 offset；它们仅配置认证 C2 局部闭包，不影响普通 KINSOL。
+  // Appended to preserve the offsets used by previously generated drivers.
+  // These configure only certified C2 local closures, not ordinary KINSOL.
+  realtype c2FunctionNormTolerance = 1e-12;
+  realtype c2ScaledStepTolerance = 1e-14;
 };
 
 Options &getOptions();

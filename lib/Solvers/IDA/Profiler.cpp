@@ -5,6 +5,9 @@
 #ifdef MARCO_PROFILING
 
 namespace marco::runtime::profiling {
+// 中文：这里只汇总实际任务计数，不能把 scalar 回调数当作 IDA 内部积分步或系统 F/J 次数。
+// English: Aggregate actual task counts here; scalar callback counts are distinct from IDA
+// internal steps and system F/J calls.
 static void recordParallelWork(
     std::vector<ParallelThreadWorkStats> &target,
     const std::vector<ParallelThreadWorkStats> &threadWork) {
@@ -73,9 +76,9 @@ void IDAProfiler::print() const {
             << initialConditionsTimer.totalElapsedTime<std::milli>() << " ms"
             << std::endl;
 
-  std::cerr << "Number of IDA steps: " << stepsCounter << std::endl;
+  std::cerr << "Number of IDA solve calls: " << stepsCounter << std::endl;
 
-  std::cerr << "Time spent on IDA steps: "
+  std::cerr << "Time spent on IDA solve calls: "
             << stepsTimer.totalElapsedTime<std::milli>() << " ms" << std::endl;
 
   std::cerr << "Time spent on computing the algebraic variables: "

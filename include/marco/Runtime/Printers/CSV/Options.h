@@ -6,6 +6,9 @@
 
 namespace marco::runtime::printing {
 struct PrintOptions {
+  // 中文：只抑制结果输出，仿真和求解器回调仍正常执行。
+  // Suppress result output only; simulation and solver callbacks still run.
+  bool noOutput = false;
   bool scientificNotation = false;
   unsigned int precision = 9;
 

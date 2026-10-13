@@ -9,6 +9,7 @@
 #include "sunmatrix/sunmatrix_sparse.h"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace marco::runtime::sundials::kinsol {
@@ -25,6 +26,16 @@ public:
   /// English: Distinguishes recoverable trial-point failures from structural
   /// or callback failures so IDA can retry with a smaller step or terminate.
   enum class SolveStatus { Success, RecoverableFailure, FatalFailure };
+
+  // 中文：回调或分配失败不能作为奇异性的证明。
+  // A failed callback or allocation is not a certificate of singularity.
+  enum class FactorizationStatus {
+    Success,
+    Singular,
+    EvaluationFailure,
+    ResourceFailure,
+    SolverFailure
+  };
 
   /// 中文：条件证书同时承载小型 dense 精确估计和大型 sparse KLU 估计；
   /// sparseEstimator 标明采用的路径，避免把近似证书误读成完整 dense 分析。
@@ -61,6 +72,37 @@ public:
     bool quietErrors{false};
   };
 
+  // 中文：被动计数按实例生命周期累计，计时为包含内部工作的区间且可重叠；读取统计不会执行残差或 Jacobian。
+  // Passive, instance-lifetime counters. Timings are inclusive and overlap;
+  // reading these values never evaluates a residual or a Jacobian.
+  struct Statistics {
+    uint64_t id{0};
+    uint64_t solves{0}, residuals{0}, jacobians{0};
+    uint64_t factorizations{0}, rightHandSides{0}, conditions{0};
+    uint64_t solveNanoseconds{0}, factorNanoseconds{0};
+    uint64_t rhsNanoseconds{0}, conditionNanoseconds{0};
+    uint64_t nonlinearIterations{0};
+    std::map<int, uint64_t> solveFlags;
+    uint64_t reusedResiduals{0};
+  };
+
+  // 中文：仅在启用 profile 时由本来必需的残差调用填写；它描述最近一次求值，不一定是最后一次求解。
+  // Populated only by already-required residual calls while profiling.
+  // It describes the most recent evaluation, not necessarily the last solve.
+  struct ResidualObservation {
+    bool available{false};
+    bool finite{true};
+    double maximumNorm{0};
+    double scaledMaximumNorm{0};
+  };
+
+  ResidualObservation getLastResidualObservation() const {
+    return lastResidualObservation;
+  }
+
+  const Statistics &getStatistics() const { return statistics; }
+  void printStatistics(const char *phase) const;
+
   SparseNonlinearSystem(Configuration configuration,
                         ResidualCallback residualCallback,
                         JacobianCallback jacobianCallback);
@@ -78,6 +120,7 @@ public:
   /// for repeated component Schur right-hand sides.
   SolveStatus solve(realtype time);
   bool factorize(realtype time);
+  FactorizationStatus factorizeWithStatus(realtype time);
   bool solveFactorized(const std::vector<double> &rhs,
                        std::vector<double> &solution);
 
@@ -132,6 +175,19 @@ public:
   }
 
 private:
+  friend class KINSOLInstance;
+  bool estimateFlatCondition(const double *matrix,
+      const std::vector<uint64_t> &rows, const std::vector<uint64_t> &columns,
+      ConditionEstimate &estimate) const;
+  // 中文：只有 facade 能把认证标量闭包的完整残差传给紧接着的 owner 健康检查；公开 solver API 和任意回调始终重新计算 F。
+  // The facade alone can transport a complete residual from its certified
+  // scalar closure into the immediate owner health check. The public solver
+  // API and arbitrary callbacks always evaluate F afresh.
+  FactorizationStatus factorizeWithResidual(
+      realtype time, const std::vector<double> &residuals);
+  FactorizationStatus factorizeImpl(
+      realtype time, const std::vector<double> *residuals);
+  void observeResidual(N_Vector residuals, int result);
   /// 中文：bridge 将用户 callback 状态归一化为 KINSOL 返回码，并记录 callback
   /// 是否真正失败，供 classifySolveFlag 区分数值重试与结构错误。
   /// English: The bridges normalize user callback status to KINSOL return
@@ -146,7 +202,9 @@ private:
                                 const char *function, char *message,
                                 void *userData);
 
-  bool evaluateJacobian(realtype time);
+  FactorizationStatus evaluateJacobian(realtype time);
+  FactorizationStatus evaluateJacobianImpl(
+      realtype time, const std::vector<double> *residuals);
   static SolveStatus classifySolveFlag(int flag, bool callbackFailed);
 
 private:
@@ -161,8 +219,11 @@ private:
   realtype currentTime{0};
   bool initialized{false};
   bool callbackFailed{false};
+  bool explicitFactorizationValid{false};
   int lastSolveFlag{KIN_SUCCESS};
   uint64_t lastNonlinearIterations{0};
+  mutable Statistics statistics;
+  ResidualObservation lastResidualObservation;
 
 #if SUNDIALS_VERSION_MAJOR >= 7
   SUNComm comm{0};
@@ -175,10 +236,31 @@ private:
   N_Vector variablesVector{nullptr};
   N_Vector variableScaleVector{nullptr};
   N_Vector residualScaleVector{nullptr};
+  // 中文：scratch 容量属于实例；每次使用都重新求残差、复制完整右端项或重置解，不跨 trial 保留数值结果。
+  //       同实例重入仍不受支持。
+  // Scratch capacity is instance-local. Every use recomputes the residual,
+  // copies the complete RHS, or resets the solution; no numerical result is
+  // carried from one trial to another. Same-instance reentry remains unsupported.
+  N_Vector factorResidualVector{nullptr};
+  N_Vector linearRightHandSideVector{nullptr};
+  N_Vector linearSolutionVector{nullptr};
   SUNMatrix sparseMatrix{nullptr};
   SUNLinearSolver linearSolver{nullptr};
   std::vector<double> currentVariableScale;
   std::vector<double> currentResidualScale;
+  // 中文：condition 查询间只保留容量，下一次使用前覆盖全部映射、矩阵、主元排列和求解向量。
+  //       稠密容量受既有 denseLimit 的最大准入查询约束，保留容量不能授权更大的稠密计算。
+  // Only capacity survives condition queries. Every mapping, matrix, pivot
+  // permutation and solve vector is overwritten before its next use. Dense
+  // capacity is bounded by the largest query admitted by the existing
+  // denseLimit; retaining it never authorizes a larger dense computation.
+  struct ConditionWorkspace {
+    std::vector<int64_t> localColumns;
+    std::vector<bool> localRows;
+    std::vector<double> dense, lu, rhs, forward, solution;
+    std::vector<uint64_t> permutation;
+  };
+  mutable ConditionWorkspace conditionWorkspace;
 };
 
 } // namespace marco::runtime::sundials::kinsol

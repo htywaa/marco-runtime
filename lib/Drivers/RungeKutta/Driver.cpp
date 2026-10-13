@@ -5,6 +5,8 @@
 #include "marco/Runtime/Simulation/Runtime.h"
 #include "marco/Runtime/Solvers/RungeKutta/Options.h"
 #include "marco/Runtime/Solvers/RungeKutta/Profiler.h"
+#include "../SimulationTime.h"
+#include <cmath>
 #include <iostream>
 
 namespace marco::runtime {
@@ -21,20 +23,34 @@ int RungeKutta::run() {
     std::cerr << "[Runge-Kutta] Starting simulation" << std::endl;
   }
 
-  double time;
+  const double startTime = getTime();
+  const double endTime = simulation::getOptions().endTime;
   double timeStep = rungekutta::getOptions().timeStep;
+  if (!std::isfinite(startTime) || !std::isfinite(endTime) || endTime < startTime ||
+      !std::isfinite(timeStep) || timeStep <= 0) {
+    std::cerr << "[Runge-Kutta] Invalid simulation interval or time step.\n";
+    return EXIT_FAILURE;
+  }
 
-  do {
+  internal::SimulationTime clock(startTime, endTime);
+  while (clock.hasNext()) {
+    // 中文：最终试步必须受剩余时域限制，接受后以新时间判断终止。
+    // English: Bound the final trial by the remaining interval and decide
+    // termination from the accepted time, not the previous step's time.
+    timeStep = clock.clipStep(timeStep);
     // Compute the next values of the state variables.
     if (marco::runtime::simulation::getOptions().debug) {
       std::cerr << "[Runge-Kutta] Updating state variables" << std::endl;
     }
 
-    time = getTime();
     uint64_t iteration = 0;
     double error;
 
     do {
+      if (!clock.canAdvance(timeStep)) {
+        std::cerr << "[Runge-Kutta] Time step cannot advance simulation time.\n";
+        return EXIT_FAILURE;
+      }
       RUNGEKUTTA_PROFILER_STATEVAR_START
       tryStep(timeStep);
       RUNGEKUTTA_PROFILER_STATEVAR_STOP
@@ -42,6 +58,10 @@ int RungeKutta::run() {
       RUNGEKUTTA_PROFILER_ERROR_START
       error = estimateError();
       RUNGEKUTTA_PROFILER_ERROR_STOP
+      if (!std::isfinite(error)) {
+        std::cerr << "[Runge-Kutta] Nonfinite error estimate.\n";
+        return EXIT_FAILURE;
+      }
 
       if (error >= rungekutta::getOptions().tolerance) {
         timeStep /= 2;
@@ -59,7 +79,7 @@ int RungeKutta::run() {
     }
 
     // Update the time.
-    setTime(time + timeStep);
+    setTime(clock.acceptStep(timeStep));
 
     RUNGEKUTTA_PROFILER_VARCOPY_START
     acceptStep();
@@ -87,7 +107,7 @@ int RungeKutta::run() {
 
     // Print the values.
     getSimulation()->getPrinter()->printValues();
-  } while (std::abs(simulation::getOptions().endTime - time) >= timeStep);
+  }
 
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[Runge-Kutta] Simulation finished" << std::endl;

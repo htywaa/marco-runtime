@@ -3,6 +3,7 @@
 
 #include "marco/Runtime/Drivers/IDA/CLI.h"
 #include "marco/Runtime/Solvers/IDA/Options.h"
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 
@@ -17,6 +18,8 @@ void CommandLineOptions::printCommandLineOptions(std::ostream &os) const {
 
   os << "  --ida-relative-tolerance=<value>       Set the relative tolerance. Defaults to " << getOptions().relativeTolerance << "." << std::endl;
   os << "  --ida-absolute-tolerance=<value>       Set the absolute tolerance. Defaults to " << getOptions().absoluteTolerance << "." << std::endl;
+  os << "  --ida-c2-function-norm-tolerance=<value> Set the C2 local scaled residual stopping tolerance. Defaults to " << getOptions().c2FunctionNormTolerance << "." << std::endl;
+  os << "  --ida-c2-scaled-step-tolerance=<value>   Set the C2 local scaled step stopping tolerance. Defaults to " << getOptions().c2ScaledStepTolerance << "." << std::endl;
   os << "  --ida-max-algebraic-abs-tol=<value>    Set the maximum absolute tolerance allowed for algebraic variables. Defaults to " << getOptions().maxAlgebraicAbsoluteTolerance << "." << std::endl;
   os << "  --ida-time-scaling-factor-ic=<value>   Set the dividing factor for the initial step size guess (the higher the value, the smaller the step). Defaults to " << getOptions().timeScalingFactorInit << "." << std::endl;
 
@@ -86,6 +89,31 @@ void CommandLineOptions::parseCommandLineOptions(
   getOptions().lineSearchOff = options["ida-line-search-off"] ? SUNTRUE : SUNFALSE;
   getOptions().printJacobian = options["ida-print-jacobian"];
   // clang-format on
+
+  auto readPositiveTolerance = [&](const char *name, realtype &destination) {
+    const auto &parameters = options.params();
+    auto parameter = parameters.find(name);
+    if (parameter == parameters.end() && !options[name])
+      return;
+    if (parameter != parameters.end() && parameters.count(name) == 1 &&
+        !parameter->second.empty()) {
+      const char *begin = parameter->second.c_str();
+      char *end = nullptr;
+      double value = std::strtod(begin, &end);
+      if (end != begin && *end == '\0' &&
+          std::isfinite(value) && value > 0) {
+        destination = value;
+        return;
+      }
+    }
+    std::cerr << "Invalid IDA option --" << name
+              << ": expected one finite positive value." << std::endl;
+    std::exit(EXIT_FAILURE);
+  };
+  readPositiveTolerance("ida-c2-function-norm-tolerance",
+                        getOptions().c2FunctionNormTolerance);
+  readPositiveTolerance("ida-c2-scaled-step-tolerance",
+                        getOptions().c2ScaledStepTolerance);
 }
 } // namespace marco::runtime::sundials::ida
 

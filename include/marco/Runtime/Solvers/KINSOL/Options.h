@@ -11,30 +11,13 @@
 
 namespace marco::runtime::sundials::kinsol {
 struct Options {
-  // Relative tolerance is intended as the difference between the values
-  // computed through the n-th and the (n+1)-th order BDF method, divided by
-  // the absolute value given by the (n+1)-th order BDF method.
-  //
-  // It is mandatory to set the parameter higher than the minimum precision
-  // of the floating point unit roundoff (10^-15 for doubles).
-  //
-  // It is also highly suggested setting the parameter lower than 10^-3 in
-  // order to avoid inaccurate results. KINSOL defaults to 10^-6.
+  // 中文：这是 legacy CLI 别名存储。KINSOL 求解非线性代数系统，不使用 BDF 误差容差。
+  //       显式提供时，relative 别名设置 scsteptol，absolute 别名设置 fnormtol。
+  // Legacy CLI alias storage. KINSOL solves a nonlinear algebraic system;
+  // it does not use BDF error tolerances. When explicitly supplied, the CLI
+  // relative alias sets scsteptol and the absolute alias sets fnormtol.
   realtype relativeTolerance = 1e-06;
 
-  // Absolute tolerance is intended as the maximum acceptable difference
-  // between the values computed through the n-th and  the (n+1)-th order BDF
-  // method.
-  //
-  // Absolute tolerance is used to substitute relative tolerance when the
-  // value converges to zero. When this happens, in fact, the relative error
-  // would tend to infinity, thus exceeding the set tolerance.
-  //
-  // It is mandatory to set the parameter higher than the minimum precision
-  // of the floating point unit roundoff (10^-15 for doubles).
-  //
-  // It is also highly suggested setting the parameter lower than 10^-3 in
-  // order to avoid inaccurate results. KINSOL defaults to 10^-6.
   realtype absoluteTolerance = 1e-06;
 
   // Arbitrary initial guess made in the 20/12/2021 Modelica Call

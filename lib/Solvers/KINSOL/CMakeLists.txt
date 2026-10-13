@@ -25,6 +25,8 @@ set(SOLVER_SRC
     # English: The shared core serves both ordinary KINSOL and IDA component-local closure.
     Instance.cpp
     Profiler.cpp
+    ScalarBlockPlan.cpp
+  ScalarBlockSolver.cpp
     SparseNonlinearSystem.cpp)
 
 marco_add_runtime_shared_library(SolverKINSOL

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -101,6 +102,87 @@ static const char *getParallelIterationKindName(
   return "unknown";
 }
 
+struct IDAInstance::C2KernelRegistration {
+  MarcoC2KernelV1 descriptor{};
+  std::vector<const void *> residuals,jacobians,getters,setters;
+  std::vector<uint64_t> matched;
+};
+
+bool IDAInstance::registerC2KernelV1(const MarcoC2KernelV1 &d) {
+  const auto key=std::make_tuple(d.domain,d.epoch,d.component);
+  if (initialized || d.version!=1 || d.descriptorBytes!=sizeof(MarcoC2KernelV1) ||
+      !d.rows || d.rows>16 || d.scratchBytes>65536 ||
+      c2Kernels.size()>=8 || c2KernelRows+d.rows>64 || c2Kernels.count(key) ||
+      !constraintExecutionEpochGroups.count(key) ||
+      !d.residuals || !d.jacobians || !d.getters || !d.setters || !d.matchedColumns ||
+      !d.residual || !d.jacobian || !d.install || !d.read || !d.health || !d.solve)
+    return false;
+  // 中文：这是已有 epoch 注册的有界只读视图，适配器不做匹配、support 传播或重新分组。
+  // A bounded read-only view of the existing epoch registrations; no matching,
+  // support propagation or grouping is performed by this adapter.
+  std::vector<Variable> variables;
+  std::vector<Equation> equations;
+  for(const auto &v:constraintExecutionEpochVariables)
+    if(std::make_tuple(v.domainId,v.epochId,v.executionGroupId)==key && v.owner=="local")
+      variables.push_back(v.variable);
+  for(const auto &e:constraintExecutionEpochEquations)
+    if(std::make_tuple(e.domainId,e.epochId,e.executionGroupId)==key && e.owner=="local")
+      equations.push_back(e.equation);
+  std::sort(variables.begin(),variables.end());
+  std::sort(equations.begin(),equations.end());
+  const auto n=d.rows;
+  if(variables.size()!=n || equations.size()!=n ||
+      std::adjacent_find(variables.begin(),variables.end())!=variables.end() ||
+      std::adjacent_find(equations.begin(),equations.end())!=equations.end()) return false;
+  uint64_t matchedMask=0;
+  for(uint64_t row=0;row<n;++row) {
+    auto v=variables[row];auto e=equations[row];
+    if(v>=algebraicAndStateVariablesGetters.size() || e>=residualFunctions.size() ||
+       getVariableFlatSize(v)!=1 || getDeclaredEquationFlatSize(e)!=1 ||
+       reinterpret_cast<const void *>(algebraicAndStateVariablesGetters[v])!=d.getters[row] ||
+       reinterpret_cast<const void *>(algebraicAndStateVariablesSetters[v])!=d.setters[row] ||
+       reinterpret_cast<const void *>(residualFunctions[e])!=d.residuals[row] ||
+       d.matchedColumns[row]>=n || (matchedMask&(uint64_t(1)<<d.matchedColumns[row])))
+      return false;
+    auto proof=scalarPolynomials.find(e);
+    if(proof==scalarPolynomials.end() ||
+       proof->second.matched!=variables[d.matchedColumns[row]]) return false;
+    matchedMask|=uint64_t(1)<<d.matchedColumns[row];
+    for(uint64_t col=0;col<n;++col) {
+      const bool accessed=e<variableAccesses.size() && std::any_of(
+          variableAccesses[e].begin(),variableAccesses[e].end(),
+          [&](const auto &access) { return access.first==variables[col]; });
+      const void *callback=accessed && e<jacobianFunctions.size() && variables[col]<jacobianFunctions[e].size()
+          ? reinterpret_cast<const void *>(jacobianFunctions[e][variables[col]].first):nullptr;
+      if(callback!=d.jacobians[row*n+col]) return false;
+    }
+  }
+  auto entry=std::make_unique<C2KernelRegistration>();
+  entry->descriptor=d;
+  entry->residuals.assign(d.residuals,d.residuals+n);
+  entry->jacobians.assign(d.jacobians,d.jacobians+n*n);
+  entry->getters.assign(d.getters,d.getters+n);
+  entry->setters.assign(d.setters,d.setters+n);
+  entry->matched.assign(d.matchedColumns,d.matchedColumns+n);
+  entry->descriptor.residuals=entry->residuals.data();
+  entry->descriptor.jacobians=entry->jacobians.data();
+  entry->descriptor.getters=entry->getters.data();
+  entry->descriptor.setters=entry->setters.data();
+  entry->descriptor.matchedColumns=entry->matched.data();
+  c2KernelRows+=n;
+  c2Kernels.emplace(key,std::move(entry));
+  return true;
+}
+
+extern "C" void _MidaRegisterC2KernelV1(void *owner,const MarcoC2KernelV1 *descriptor) {
+  if (!owner || !descriptor ||
+      !static_cast<IDAInstance *>(owner)->registerC2KernelV1(*descriptor)) {
+    std::cerr << "[IDA] c2_kernel_v1_invalid_version_or_binding" << std::endl;
+    std::abort();
+  }
+}
+
+
 struct IDAInstance::ConstraintComponentExecutionRuntime {
   // 中文：一个 runtime execution group 可包含多个语义 component，并拥有一个
   // 稀疏 local closure、DAG 依赖、condition block 与 Schur 响应缓存。
@@ -113,6 +195,7 @@ struct IDAInstance::ConstraintComponentExecutionRuntime {
   std::vector<uint64_t> dependencies;
   uint64_t topologicalOrder{0};
   uint64_t stateSetId{0};
+  uint64_t createdBasisEpoch{0};
   std::unique_ptr<kinsol::KINSOLInstance> solver;
   std::vector<Variable> globalVariables;
   std::vector<Equation> globalEquations;
@@ -140,6 +223,8 @@ struct IDAInstance::ConstraintComponentExecutionRuntime {
   uint64_t localSolveRecoverableFailures{0};
   uint64_t localSolveFatalFailures{0};
   uint64_t localNonlinearIterations{0};
+  bool generatedC2Kernel{false};
+  uint64_t generatedHealthCertificates{0};
   double maximumLocalResidual{0};
   double maximumLocalResidualTime{0};
   double maximumCondition{0};
@@ -151,7 +236,15 @@ struct IDAInstance::ConstraintComponentExecutionRuntime {
   ConstraintBasisHealthCertificate lastHealthCertificate;
   uint64_t schurFactorizations{0};
   uint64_t schurRightHandSides{0};
+  uint64_t schurScalarJacobianCalls{0};
   uint64_t schurFillEntries{0};
+  struct ResidualStatistics {
+    uint64_t evaluations{0};
+    uint64_t nonfinite{0};
+    double maximum{0};
+    double scaledMaximum{0};
+  };
+  ResidualStatistics preResidual, postResidual, failedResidual;
 };
 
 static void printParallelIterationStats(
@@ -510,20 +603,29 @@ IDAInstance::IDAInstance()
 }
 
 IDAInstance::~IDAInstance() {
+  if (marco::runtime::simulation::getOptions().profiling && initialized &&
+      getNumOfScalarEquations() != 0) {
+    std::cerr << "[ida-statistics] phase=final_epoch instance=" << this
+              << " epoch=" << statisticsEpoch
+              << " time=" << currentTime << std::endl;
+    printStatistics();
+  }
+  if (marco::runtime::simulation::getOptions().profiling)
+    printConstraintExecutionStatistics("[ida-local-statistics]");
   if (isStage6GRuntimeProbeEnabled() && !constraintComponents.empty()) {
     printConstraintProbeSummary();
   }
 
-  if (getNumOfScalarEquations() != 0) {
-    N_VDestroy(variablesVector);
-    N_VDestroy(derivativesVector);
-    N_VDestroy(idVector);
-    N_VDestroy(tolerancesVector);
-
-    IDAFree(&idaMemory);
-    SUNLinSolFree(linearSolver);
-    SUNMatDestroy(sparseMatrix);
-  }
+  // 中文：初始化可能在分配向量后、IDACreate 前因晚期结构证书失败；只释放实际已构造的资源。
+  // Initialization can reject a late structural certificate after allocating
+  // vectors but before IDACreate. Release only resources actually constructed.
+  if (idaMemory) IDAFree(&idaMemory);
+  if (linearSolver) SUNLinSolFree(linearSolver);
+  if (sparseMatrix) SUNMatDestroy(sparseMatrix);
+  if (variablesVector) N_VDestroy(variablesVector);
+  if (derivativesVector) N_VDestroy(derivativesVector);
+  if (idVector) N_VDestroy(idVector);
+  if (tolerancesVector) N_VDestroy(tolerancesVector);
 
 #if SUNDIALS_VERSION_MAJOR >= 6
   if (ctx != nullptr) {
@@ -1310,6 +1412,12 @@ bool IDAInstance::isLocalEquation(Equation equation) const {
 }
 
 bool IDAInstance::prepareConstraintComponentExecutions() {
+  // 中文：每次执行/epoch 重建时只选择一次；普通模型不在 residual/Jacobian/health 回调内反复探测生成核。
+  // Select once per execution/epoch rebuild. Ordinary models do not probe for
+  // generated kernels inside their residual/Jacobian/health callbacks.
+  constraintSolveEntry = c2Kernels.empty()
+      ? &IDAInstance::solveConstraintComponentsBody<false>
+      : &IDAInstance::solveConstraintComponentsBody<true>;
   // 中文：根据当前 active state set/epoch 重建 outer/local descriptor 布局，按
   // 编译期拓扑序创建每个 local KINSOL；这里不重新 Matching 或猜测 ownership。
   // English: Rebuild outer/local descriptor layouts for the active state
@@ -1317,6 +1425,11 @@ bool IDAInstance::prepareConstraintComponentExecutions() {
   // This stage never reruns Matching or infers ownership.
   localConstraintVariables.assign(getNumOfArrayVariables(), false);
   localConstraintEquations.assign(getNumOfVectorizedEquations(), false);
+  // 中文：solver 销毁前保留 retired execution 的统计归属；按 solver_id 保存累计快照，不能把它当作可相加的样本。
+  // Preserve attribution for retired executions before their solvers disappear.
+  // These are cumulative snapshots keyed by solver_id, not additive samples.
+  if (marco::runtime::simulation::getOptions().profiling)
+    printConstraintExecutionStatistics("[ida-local-retired-statistics]");
   constraintComponentExecutions.clear();
 
   for (uint64_t groupId : activeEpochRuntimeExecutionGroupIds) {
@@ -1622,6 +1735,7 @@ bool IDAInstance::prepareConstraintComponentExecutions() {
         solverExecutionGroups.at(executionGroupId);
     auto execution = std::make_unique<ConstraintComponentExecutionRuntime>();
     execution->executionGroupId = executionGroupId;
+    execution->createdBasisEpoch = basisEpoch;
     execution->semanticComponentIds =
         groupDescriptor.semanticComponentIds;
     // 中文：持久图还包含 helper schedule 和 promoted-IDA dependencies；这些
@@ -1660,8 +1774,10 @@ bool IDAInstance::prepareConstraintComponentExecutions() {
       }
     }
     execution->solver = std::make_unique<kinsol::KINSOLInstance>();
-    execution->solver->setFunctionNormTolerance(1e-12);
-    execution->solver->setScaledStepTolerance(1e-14);
+    execution->solver->setFunctionNormTolerance(
+        getOptions().c2FunctionNormTolerance);
+    execution->solver->setScaledStepTolerance(
+        getOptions().c2ScaledStepTolerance);
     execution->solver->setLineSearchEnabled(true);
     execution->solver->setQuietErrors(true);
 
@@ -1862,6 +1978,12 @@ bool IDAInstance::prepareConstraintComponentExecutions() {
     }
 
     execution->localScalars = localVariableScalars;
+    // 中文：访问来自已校验组件/epoch ownership 布局，是固定索引映射；新 epoch 构造新局部 solver。
+    //       访问纯度未知的普通 KINSOL 回调不启用这条优化路线。
+    // Accesses come from the validated component/epoch ownership layout and
+    // are fixed index maps. A new epoch builds a new local solver. Ordinary
+    // KINSOL callbacks with unknown access purity do not opt into this path.
+    execution->solver->requestImmutableAccessLayout();
     execution->solver->setMaximumNewtonStep(std::max<realtype>(
         100, 10 * std::sqrt(static_cast<realtype>(localVariableScalars))));
 
@@ -2175,6 +2297,160 @@ bool IDAInstance::prepareConstraintComponentExecutions() {
                 << " scaling_source=initialization_anchor" << std::endl;
     }
 
+    // 中文：将编译器多项式 support 限制到当前实际活动闭包；原配对由已验证 epoch 描述符独立绑定，候选不能重新匹配局部方程。
+    // Restrict compiler polynomial supports to this exact active closure. The
+    // original pairing is independently bound through the validated epoch
+    // descriptors; a candidate never rematches local equations.
+    if (!scalarPolynomials.empty() && execution->localScalars <= 64 &&
+        execution->localScalars == execution->globalVariables.size() &&
+        execution->localScalars == execution->globalEquations.size()) {
+      auto charge = [&](uint64_t work, uint64_t storage = 0) {
+        if (work > scalarPolynomialBudget.work ||
+            storage > scalarPolynomialBudget.storage) return false;
+        scalarPolynomialBudget.work -= work;
+        scalarPolynomialBudget.storage -= storage;
+        return true;
+      };
+      bool available = charge(execution->localScalars,
+          execution->localScalars * (sizeof(kinsol::ScalarBlockPlan::Row) +
+                                     sizeof(ResidualFunction) + 256));
+      bool consistent = true;
+      std::map<Equation, std::string> matches;
+      std::map<Variable, std::string> names;
+      auto addEquation = [&](Equation equation, const std::string &name) {
+        if (!available || !execution->localEquationIds.count(equation)) return;
+        if (!charge(1, name.size() + 1)) { available = false; return; }
+        auto [it, inserted] = matches.emplace(equation, name);
+        if (!inserted && it->second != name) consistent = false;
+      };
+      auto addVariable = [&](Variable variable, const std::string &name) {
+        if (!available || !execution->localVariableIds.count(variable)) return;
+        if (!charge(1, name.size() + 1)) { available = false; return; }
+        auto [it, inserted] = names.emplace(variable, name);
+        if (!inserted && it->second != name) consistent = false;
+      };
+      // 中文：根据执行的真实 epoch、普通组件或活动 state-set 收集原配对名称；所有身份来自既有注册，不能用可选多项式计划替代 ownership。
+      // English: Collect original pairing names from the actual epoch, ordinary component, or
+      //          active state-set execution. Existing registrations remain the ownership authority,
+      //          not the optional polynomial plan.
+      if (epochGroup != epochRuntimeExecutionGroupIds.end()) {
+        auto domain = std::get<0>(epochGroup->first);
+        auto epoch = std::get<1>(epochGroup->first);
+        available &= charge(constraintExecutionEpochEquations.size() +
+                            constraintExecutionEpochVariables.size());
+        if (available) {
+          for (const auto &entry : constraintExecutionEpochEquations)
+            if (entry.domainId == domain && entry.epochId == epoch)
+              addEquation(entry.equation, entry.matchedVariableName);
+          for (const auto &entry : constraintExecutionEpochVariables)
+            if (entry.domainId == domain && entry.epochId == epoch)
+              addVariable(entry.variable, entry.name);
+        }
+      } else if (constraintStateSets.empty()) {
+        available &= charge(constraintEquations.size() + constraintVariables.size());
+        if (available) {
+          for (const auto &entry : constraintEquations)
+            if (execution->semanticComponentIds.count(entry.componentId))
+              addEquation(entry.equation, entry.matchedVariableName);
+          for (const auto &entry : constraintVariables)
+            if (execution->semanticComponentIds.count(entry.componentId))
+              addVariable(entry.variable, entry.name);
+        }
+      } else {
+        available &= charge(constraintStateSetEquations.size() +
+                            constraintStateSetVariables.size());
+        auto active = [&](uint64_t component, uint64_t stateSet) {
+          auto it = activeStateSets.find(component);
+          return execution->semanticComponentIds.count(component) &&
+                 it != activeStateSets.end() && it->second == stateSet;
+        };
+        if (available) {
+          for (const auto &entry : constraintStateSetEquations)
+            if (active(entry.componentId, entry.stateSetId))
+              addEquation(entry.equation, entry.matchedVariableName);
+          for (const auto &entry : constraintStateSetVariables)
+            if (active(entry.componentId, entry.stateSetId))
+              addVariable(entry.variable, entry.name);
+        }
+      }
+      std::vector<kinsol::ScalarBlockPlan::Row> rows;
+      std::vector<ResidualFunction> explicitValues;
+      if (available) {
+        rows.reserve(execution->localScalars);
+        explicitValues.reserve(execution->localScalars);
+      }
+      // 中文：把编译器 support 的变量位编号映射到当前局部列，并独立核对所选配对名称；部分缺失证明只放弃优化，矛盾绑定仍属错误。
+      // English: Map compiler support bits into current local columns and independently check
+      //          selected-pairing names. Missing proof declines optimization; contradictory
+      //          bindings remain errors.
+      for (Equation equation : execution->globalEquations) {
+        if (!available) break;
+        auto found = scalarPolynomials.find(equation);
+        if (found == scalarPolynomials.end()) { available = false; break; }
+        const auto &proof = found->second;
+        auto column = execution->localVariableOffsets.find(proof.matched);
+        if (column == execution->localVariableOffsets.end() ||
+            !names.count(proof.matched) || !matches.count(equation) ||
+            names.at(proof.matched) != matches.at(equation)) {
+          consistent = false;
+          break;
+        }
+        if (!charge(proof.terms.size() * (proof.variables.size() + 1) +
+                        variableAccesses[equation].size(),
+                    proof.terms.size() * sizeof(kinsol::ScalarBlockPlan::Term))) {
+          available = false;
+          break;
+        }
+        kinsol::ScalarBlockPlan::Row row;
+        row.matchedColumn = column->second;
+        row.polynomialCertified = true;
+        row.explicitValueCertified = proof.explicitValue != nullptr;
+        uint64_t polynomialReads = 0;
+        row.terms.reserve(proof.terms.size());
+        for (auto term : proof.terms) {
+          kinsol::ScalarBlockPlan::Term restricted;
+          for (size_t i = 0; i < proof.variables.size(); ++i) {
+            auto local = execution->localVariableOffsets.find(proof.variables[i]);
+            if (local == execution->localVariableOffsets.end()) continue;
+            if (term.linear & (uint64_t(1) << i))
+              restricted.linear |= uint64_t(1) << local->second;
+            if (term.squared & (uint64_t(1) << i))
+              restricted.squared |= uint64_t(1) << local->second;
+          }
+          polynomialReads |= restricted.linear | restricted.squared;
+          row.terms.push_back(restricted);
+        }
+        for (const auto &[variable, access] : variableAccesses[equation]) {
+          auto local = execution->localVariableOffsets.find(variable);
+          if (local != execution->localVariableOffsets.end())
+            row.reads |= uint64_t(1) << local->second;
+        }
+        // 中文：保守或死访问可能阻止该可选等价证明，此时保留原正确执行路径。
+        // Conservative/dead accesses may prevent this optional equivalence
+        // proof. They remain on the original correct execution path.
+        if (row.reads != polynomialReads) { available = false; break; }
+        rows.push_back(std::move(row));
+        explicitValues.push_back(proof.explicitValue);
+      }
+      if (!consistent || (available &&
+          !execution->solver->requestScalarBlockPlan(std::move(rows),
+                                                     std::move(explicitValues),
+                                                     scalarPolynomialBudget))) {
+        std::cerr << "[IDA] Scalar polynomial pairing certificate mismatch"
+                  << std::endl;
+        return false;
+      }
+    }
+    if (epochGroup != epochRuntimeExecutionGroupIds.end()) {
+      auto kernel=c2Kernels.find(epochGroup->first);
+      if (kernel!=c2Kernels.end()) {
+        if (!execution->solver->bindC2KernelV1(kernel->second->descriptor)) {
+          std::cerr << "[IDA] c2_kernel_v1_invalid_active_binding" << std::endl;
+          return false;
+        }
+        execution->generatedC2Kernel=execution->solver->hasC2KernelV1();
+      }
+    }
     constraintComponentExecutions.push_back(std::move(execution));
   }
 
@@ -2379,12 +2655,21 @@ bool IDAInstance::evaluateConstraintJacobian(
   if (seedsIt == execution.couplingSeeds.end()) {
     return false;
   }
+  if (marco::runtime::simulation::getOptions().profiling) {
+    ++epochSchurJacobianCalls;
+    ++execution.schurScalarJacobianCalls;
+  }
   result = descriptor.first(time, equationIndices.data(), column.second.data(),
                             alpha, memoryPoolId, seedsIt->second.data());
   return std::isfinite(result);
 }
 
 int IDAInstance::solveConstraintComponents(realtype time) {
+  return (this->*constraintSolveEntry)(time);
+}
+
+template <bool Generated>
+int IDAInstance::solveConstraintComponentsBody(realtype time) {
   // 中文：每次 IDA residual/Jacobian 试探先按 group DAG 刷新局部闭包。普通
   // Newton 失败可恢复；condition/rank 触发只登记 pending switch，真正事务在
   // 最近 accepted checkpoint 上执行。
@@ -2412,6 +2697,9 @@ int IDAInstance::solveConstraintComponents(realtype time) {
         return -1;
       }
       execution->scalingConfigured = true;
+      execution->generatedC2Kernel = execution->solver->hasC2KernelV1();
+      if (marco::runtime::simulation::getOptions().profiling)
+        execution->solver->printInitializationScaling();
     }
 
     auto requestBasisSwitch = [&](const char *phase,
@@ -2462,7 +2750,52 @@ int IDAInstance::solveConstraintComponents(realtype time) {
     // both the chart sub-block and complete local closure.
     auto checkConditionCertificate = [&](const char *phase,
                                          bool failedLocalTrial) {
-      if (!execution->solver->factorizeCurrentJacobian(time)) {
+      using FactorizationStatus =
+          kinsol::SparseNonlinearSystem::FactorizationStatus;
+      kinsol::SparseNonlinearSystem::ConditionEstimate sparseEstimate;
+      kinsol::SparseNonlinearSystem::ConditionEstimate localSparseEstimate;
+      bool boundedHealthy = false;
+      if constexpr (Generated) {
+        boundedHealthy = execution->generatedC2Kernel &&
+          !failedLocalTrial && !evaluatingBasisCandidate &&
+          !isStage6GRuntimeProbeEnabled() &&
+          (!execution->lastHealthCertificate.responseAvailable ||
+           execution->lastHealthCertificate.responseAmplification < 1e4) &&
+          execution->solver->certifyC2KernelPoint(time, execution->conditionRows,
+              execution->conditionColumns, sparseEstimate, localSparseEstimate);
+      }
+      auto factorization =
+          boundedHealthy ? FactorizationStatus::Success :
+              execution->solver->factorizeCurrentJacobianWithStatus(time);
+      if (boundedHealthy) ++execution->generatedHealthCertificates;
+      if (marco::runtime::simulation::getOptions().profiling) {
+        auto observation = execution->solver->getLastResidualObservation();
+        auto &totals = failedLocalTrial
+                           ? execution->failedResidual
+                           : (std::string(phase) == "pre_solve"
+                                  ? execution->preResidual
+                                  : execution->postResidual);
+        if (observation.available) {
+          ++totals.evaluations;
+          totals.nonfinite += !observation.finite;
+          totals.maximum = std::max(totals.maximum, observation.maximumNorm);
+          totals.scaledMaximum =
+              std::max(totals.scaledMaximum, observation.scaledMaximumNorm);
+        }
+      }
+      if (factorization != FactorizationStatus::Success) {
+        if (factorization != FactorizationStatus::Singular) {
+          std::cerr << "stage6gb_local_solve_failed execution_group="
+                    << execution->executionGroupId << " time=" << time
+                    << " phase=" << phase << " kind="
+                    << (factorization == FactorizationStatus::EvaluationFailure
+                            ? "jacobian_evaluation_failed"
+                        : factorization == FactorizationStatus::ResourceFailure
+                            ? "resource_exhausted"
+                            : "jacobian_factorization_failed")
+                    << std::endl;
+          return false;
+        }
         ConstraintConditionEstimate estimate;
         estimate.rankDeficient = true;
         estimate.oneNormCondition = std::numeric_limits<double>::infinity();
@@ -2471,8 +2804,7 @@ int IDAInstance::solveConstraintComponents(realtype time) {
         return false;
       }
       uint64_t conditionSize = execution->conditionRows.size();
-      kinsol::SparseNonlinearSystem::ConditionEstimate sparseEstimate;
-      if (!execution->solver->estimateScaledJacobianCondition(
+      if (!boundedHealthy && !execution->solver->estimateScaledJacobianCondition(
               execution->conditionRows, execution->conditionColumns,
               sparseEstimate)) {
         std::cerr << "stage6gb_component_requires_c3 execution_group="
@@ -2491,8 +2823,7 @@ int IDAInstance::solveConstraintComponents(realtype time) {
       estimate.sparseEstimator = sparseEstimate.sparseEstimator;
       std::vector<uint64_t> localIndices(execution->localScalars);
       std::iota(localIndices.begin(), localIndices.end(), 0);
-      kinsol::SparseNonlinearSystem::ConditionEstimate localSparseEstimate;
-      if (!execution->solver->estimateScaledJacobianCondition(
+      if (!boundedHealthy && !execution->solver->estimateScaledJacobianCondition(
               localIndices, localIndices, localSparseEstimate)) {
         std::cerr << "stage6gb_component_requires_c3 execution_group="
                   << execution->executionGroupId
@@ -2588,8 +2919,11 @@ int IDAInstance::solveConstraintComponents(realtype time) {
     }
 
     ++execution->localSolveAttempts;
+    bool postHealthy = false;
     kinsol::KINSOLInstance::SolveStatus status =
-        execution->solver->solveWithStatus(time);
+        execution->solver->solveAndCheck(time, [&] {
+          postHealthy = checkConditionCertificate("post_solve", false);
+        });
     execution->localNonlinearIterations +=
         execution->solver->getLastNonlinearIterations();
     if (status != kinsol::KINSOLInstance::SolveStatus::Success) {
@@ -2614,7 +2948,7 @@ int IDAInstance::solveConstraintComponents(realtype time) {
                 << " kind=fatal" << std::endl;
       return -1;
     }
-    if (!checkConditionCertificate("post_solve", false)) {
+    if (!postHealthy) {
       return -1;
     }
     ++execution->localSolveSuccesses;
@@ -2623,6 +2957,8 @@ int IDAInstance::solveConstraintComponents(realtype time) {
       double maximumLocalResidual = 0;
       for (const auto &[equation, equationIndices] :
            execution->localScalarRows) {
+        if (marco::runtime::simulation::getOptions().profiling)
+          ++epochProbeResidualCalls;
         double value = residualFunctions[equation](time,
                                                     equationIndices.data());
         if (!std::isfinite(value)) {
@@ -2651,7 +2987,30 @@ int IDAInstance::solveConstraintComponents(realtype time) {
   return 0;
 }
 bool IDAInstance::refreshConstraintComponents(realtype time) {
-  return solveConstraintComponents(time) == 0;
+  if (!scalarPolynomialRegistrationValid) {
+    std::cerr << "[IDA] Invalid or stale V1 scalar polynomial registration\n";
+    return false;
+  }
+  if (getNumOfScalarEquations() != 0)
+    return solveConstraintComponents(time) == 0;
+
+  // 中文：完全局部系统没有外层 IDA 向量，必须显式保存已接受模型值，避免后续组失败时发布前面组的 trial 值。
+  //       每个局部 solver 在下次调用时重新加载这些值。
+  // No outer IDA vector exists in a wholly local system. Keep its accepted
+  // model values explicitly so a failure in a later group cannot publish the
+  // earlier groups' trial values. Each local solver reloads these values at
+  // its next invocation.
+  std::vector<std::pair<JacobianColumn, double>> acceptedValues;
+  for (const auto &execution : constraintComponentExecutions)
+    for (const JacobianColumn &column : execution->localScalarColumns)
+      acceptedValues.emplace_back(
+          column, algebraicAndStateVariablesGetters[column.first](
+                      column.second.data()));
+  if (solveConstraintComponents(time) == 0)
+    return true;
+  for (const auto &[column, value] : acceptedValues)
+    algebraicAndStateVariablesSetters[column.first](value, column.second.data());
+  return false;
 }
 
 void IDAInstance::saveAcceptedConstraintCheckpoint(realtype time) {
@@ -2878,6 +3237,18 @@ bool IDAInstance::rebuildIDAAfterBasisSwitch(realtype time) {
     return false;
   }
 
+  // 中文：IDAReInit 会重置 SUNDIALS 计数；释放线性求解器或重置 IDA 前，将已完成 epoch 保存到可选诊断中。
+  // IDAReInit resets the SUNDIALS counters. Preserve the completed epoch in
+  // optional diagnostics before freeing its linear solver or resetting IDA.
+  if (marco::runtime::simulation::getOptions().profiling && initialized &&
+      getNumOfScalarEquations() != 0) {
+    std::cerr << "[ida-statistics] phase=before_reinit instance=" << this
+              << " epoch=" << statisticsEpoch
+              << " time=" << time << std::endl;
+    printStatistics();
+    printConstraintExecutionStatistics("[ida-local-statistics]");
+  }
+
   N_VConst(0, idVector);
   N_VConst(0, tolerancesVector);
   for (Variable variable = 0; variable < getNumOfArrayVariables(); ++variable) {
@@ -2916,6 +3287,14 @@ bool IDAInstance::rebuildIDAAfterBasisSwitch(realtype time) {
     std::cerr << "stage6gc_ida_reinit_failed time=" << time << std::endl;
     return false;
   }
+  ++statisticsEpoch;
+  epochSolveCalls = epochResidualCalls = epochJacobianCalls = 0;
+  epochScalarResidualCalls = epochScalarJacobianCalls = 0;
+  epochBatchResidualCalls = 0;
+  epochBatchJacobianCalls = 0;
+  epochBatchJacobianBaselines = 0;
+  epochPreparedPrimalValues = 0;
+  epochSchurJacobianCalls = epochCandidateResidualCalls = epochProbeResidualCalls = 0;
 
 #if SUNDIALS_VERSION_MAJOR >= 6
   sparseMatrix = SUNSparseMatrix(
@@ -3104,6 +3483,8 @@ bool IDAInstance::performPendingBasisSwitch() {
       std::vector<int64_t> indices;
       getEquationBeginIndices(equation, indices);
       do {
+        if (marco::runtime::simulation::getOptions().profiling)
+          ++epochCandidateResidualCalls;
         double value = std::abs(residualFunctions[equation](
             acceptedConstraintCheckpoint.time, indices.data()));
         if (!std::isfinite(value)) {
@@ -4213,6 +4594,8 @@ Equation IDAInstance::addEquation(const int64_t *ranges, uint64_t equationRank,
 
 void IDAInstance::addVariableAccess(Equation equation, Variable variable,
                                     AccessFunction accessFunction) {
+  invalidateScalarPolynomial(equation);
+  invalidateBatchJacobian(equation);
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Adding access information" << std::endl;
     std::cerr << "  - Equation: " << equation << std::endl;
@@ -4237,6 +4620,8 @@ void IDAInstance::addVariableAccess(Equation equation, Variable variable,
 void IDAInstance::addVariableRangeAccess(Equation equation, Variable variable,
                                          const int64_t *ranges,
                                          uint64_t rank) {
+  invalidateScalarPolynomial(equation);
+  invalidateBatchJacobian(equation);
   assert(equation < getNumOfVectorizedEquations());
   assert(variable < getNumOfArrayVariables());
 
@@ -4257,6 +4642,8 @@ void IDAInstance::addVariableRangeAccess(Equation equation, Variable variable,
 
 void IDAInstance::setResidualFunction(Equation equation,
                                       ResidualFunction residualFunction) {
+  invalidateScalarPolynomial(equation);
+  invalidateBatchJacobian(equation);
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Setting residual function for equation " << equation
               << ". Address: " << reinterpret_cast<void *>(residualFunction)
@@ -4268,12 +4655,641 @@ void IDAInstance::setResidualFunction(Equation equation,
   }
 
   residualFunctions[equation] = residualFunction;
+  // 中文：标量定义替换后，其可选编译批量定义立即失效。
+  // Replacing the scalar definition invalidates its optional compiled batch.
+  if (equation < batchResidualFunctions.size()) {
+    if (initialized && batchResidualFunctions[equation].function)
+      batchResidualRegistrationValid = false;
+    batchResidualFunctions[equation] = {};
+  }
+}
+
+void IDAInstance::invalidateBatchJacobian(Equation equation) {
+  if (equation >= batchJacobianFunctions.size()) return;
+  if (initialized && batchJacobianFunctions[equation].function)
+    batchJacobianRegistrationValid = false;
+  batchJacobianFunctions[equation] = {};
+}
+
+// 中文：批量注册须与已有标量行、变量和回调一致；覆盖不完整不能发布半套加速布局。
+// English: Batch registration must agree with existing scalar rows, variables and callbacks;
+// incomplete coverage cannot publish a partial accelerated layout.
+bool IDAInstance::validateBatchRegistration() const {
+  if (batchResidualRegistrationValid && batchJacobianRegistrationValid)
+    return true;
+  std::cerr << "[IDA] Invalid or stale V1 batch callback registration\n";
+  return false;
+}
+
+bool IDAInstance::setBatchResidualFunctionV1(
+    Equation equation, uint64_t count, BatchResidualFunctionV1 function) {
+  if (initialized || equation >= getNumOfVectorizedEquations() || !function ||
+      !count ||
+      count != getDeclaredEquationFlatSize(equation) ||
+      (equation < batchResidualFunctions.size() &&
+       batchResidualFunctions[equation].function)) {
+    batchResidualRegistrationValid = false;
+    return false;
+  }
+  if (batchResidualFunctions.size() <= equation)
+    batchResidualFunctions.resize(equation + 1);
+  batchResidualFunctions[equation] = {function, count};
+  return true;
+}
+
+bool IDAInstance::chargeBatchAnalysis(uint64_t work, uint64_t storage) {
+  if (!batchAnalysisLimitRead) {
+    batchAnalysisLimitRead = true;
+    if (const char *text = std::getenv("MARCO_IDA_BATCH_WORK_LIMIT")) {
+      char *end = nullptr;
+      auto limit = std::strtoull(text, &end, 10);
+      if (!*text || *text == '-' || *end)
+        limit = 0;
+      batchAnalysisWork = std::min<uint64_t>(batchAnalysisWork, limit);
+    }
+  }
+  if (work > batchAnalysisWork || storage > batchAnalysisStorage) {
+    if ((batchAnalysisWork || batchAnalysisStorage) &&
+        marco::runtime::simulation::getOptions().profiling)
+      std::cerr << "[ida-batch-budget] requested_work=" << work
+                << " remaining_work=" << batchAnalysisWork
+                << " requested_storage=" << storage
+                << " remaining_storage=" << batchAnalysisStorage << "\n";
+    batchAnalysisWork = batchAnalysisStorage = 0;
+    return false;
+  }
+  batchAnalysisWork -= work;
+  batchAnalysisStorage -= storage;
+  return true;
+}
+
+bool IDAInstance::setBatchJacobianFunctionV1(
+    Equation equation, uint64_t count, BatchJacobianFunctionV1 function,
+    uint64_t numVariables, const uint64_t *variables) {
+  if (initialized || equation >= getNumOfVectorizedEquations() || !function ||
+      !count || count != getDeclaredEquationFlatSize(equation) ||
+      !numVariables || numVariables > getNumOfArrayVariables() || !variables ||
+      (equation < batchJacobianFunctions.size() &&
+       batchJacobianFunctions[equation].function)) {
+    batchJacobianRegistrationValid = false;
+    return false;
+  }
+  std::set<Variable> unique;
+  for (uint64_t i = 0; i < numVariables; ++i)
+    if (variables[i] >= getNumOfArrayVariables() ||
+        !unique.insert(variables[i]).second) {
+      batchJacobianRegistrationValid = false;
+      return false;
+    }
+  // 中文：契约校验为必需步骤；可选计划或存储分配失败不能拒绝标量 Jacobian 回调原本支持的模型。
+  // Contract validation is mandatory. Optional plan/storage failure must not
+  // reject a model already served by its scalar Jacobian callbacks.
+  const uint64_t newDescriptors = equation < batchJacobianFunctions.size()
+                                      ? 0
+                                      : equation + 1 - batchJacobianFunctions.size();
+  if (!chargeBatchAnalysis(numVariables + newDescriptors + 1,
+                           newDescriptors * sizeof(BatchJacobianDescriptorV1) +
+                               2 * numVariables * sizeof(uint64_t)))
+    return true;
+  if (batchJacobianFunctions.size() <= equation)
+    batchJacobianFunctions.resize(equation + 1);
+  auto &descriptor = batchJacobianFunctions[equation];
+  descriptor.function = function;
+  descriptor.count = count;
+  descriptor.variables.assign(variables, variables + numVariables);
+  return true;
+}
+
+bool IDAInstance::setBatchTangentFunctionV2(
+    Equation equation, uint64_t count, BatchJacobianFunctionV1 function,
+    uint64_t numVariables, const uint64_t *variables) {
+  if (!setBatchJacobianFunctionV1(equation, count, function,
+                                 numVariables, variables))
+    return false;
+  // 中文：有效注册可以因可选存储不足而放弃，标量后备仍完整；两个版本使用相同身份及失效规则。
+  // A valid registration may decline optional storage; scalar fallback is
+  // still complete. Both versions retain identical identity/invalidation.
+  if (equation < batchJacobianFunctions.size() &&
+      batchJacobianFunctions[equation].function)
+    batchJacobianFunctions[equation].pureTangent = true;
+  return true;
+}
+
+bool IDAInstance::setBatchPreparedTangentV3(
+    Equation equation, uint64_t count, BatchPreparedTangentFunctionV3 function,
+    const void *layoutIdentity, uint64_t slots) {
+  auto invalid = [&] { batchJacobianRegistrationValid = false; return false; };
+  if (initialized || equation >= getNumOfVectorizedEquations() || !function ||
+      !layoutIdentity || !slots || slots > 16000000 / (sizeof(double) + 1) ||
+      count != getDeclaredEquationFlatSize(equation)) return invalid();
+  // 中文：V2 可选存储缺失仅表示优化未命中，标量后备仍有效；上面的基础 ABI 校验仍必须执行。
+  // Missing optional V2 storage is an optimization miss. Its scalar fallback
+  // remains valid; basic ABI validation above is still mandatory.
+  if (equation >= batchJacobianFunctions.size() ||
+      !batchJacobianFunctions[equation].function) return true;
+  auto &plan = batchJacobianFunctions[equation];
+  if (!plan.pureTangent || plan.count != count || plan.preparedFunction)
+    return invalid();
+  for (const auto &other : batchJacobianFunctions)
+    if (other.preparedIdentity == layoutIdentity && other.preparedSlots != slots)
+      return invalid();
+  if (!chargeBatchAnalysis(1)) return true;
+  plan.preparedFunction = function;
+  plan.preparedIdentity = layoutIdentity;
+  plan.preparedSlots = slots;
+  return true;
+}
+
+bool IDAInstance::prepareBatchPrimalStorage() {
+  for (auto &plan : batchJacobianFunctions) {
+    if (!plan.enabled || !plan.preparedFunction) continue;
+    if (!chargeBatchAnalysis(batchPreparedGroups.size() + 1)) continue;
+    auto found = std::find_if(batchPreparedGroups.begin(), batchPreparedGroups.end(),
+        [&](const auto &group) { return group.identity == plan.preparedIdentity; });
+    if (found != batchPreparedGroups.end()) {
+      if (found->values.size() != plan.preparedSlots) return false;
+      plan.preparedGroup = std::distance(batchPreparedGroups.begin(), found);
+      continue;
+    }
+    const uint64_t bytes = plan.preparedSlots * (sizeof(double) + 1) +
+                           2 * sizeof(BatchPreparedGroup);
+    // 中文：不能因请求过大的可选工作区耗尽剩余账本；只计实际预检工作并保留 V2。
+    // Do not consume the remaining ledger merely by requesting an oversized
+    // optional workspace; account for the actual preflight and keep V2.
+    if (!chargeBatchAnalysis(1)) continue;
+    if (bytes > batchAnalysisStorage) continue;
+    if (!chargeBatchAnalysis(1, bytes)) continue;
+    plan.preparedGroup = batchPreparedGroups.size();
+    batchPreparedGroups.push_back({plan.preparedIdentity,
+        std::vector<double>(plan.preparedSlots),
+        std::vector<uint8_t>(plan.preparedSlots, 0)});
+    if (marco::runtime::simulation::getOptions().profiling)
+      std::cerr << "[ida-batch-preparation] group=" << plan.preparedGroup
+                << " slots=" << plan.preparedSlots << "\n";
+  }
+  return true;
+}
+
+void IDAInstance::invalidateScalarPolynomial(Equation equation) {
+  if (scalarPolynomials.erase(equation) && initialized) {
+    // 中文：活动组件 solver 保留注册时的回调绑定，定义改变后不能继承旧执行的多项式证明。
+    //       初始化前丢弃可选证明即可；初始化后必须在执行失效绑定回调之前停止。
+    // Active component solvers retain callback bindings from registration.
+    // A changed definition cannot inherit that execution's polynomial proof.
+    // Before initialization, discarding this optional proof is sufficient;
+    // after initialization, stop before executing the stale bound callbacks.
+    scalarPolynomialRegistrationValid = false;
+  }
+}
+
+bool IDAInstance::setScalarPolynomialV1(
+    Equation equation, Variable matched, uint64_t numVariables,
+    const uint64_t *variables, uint64_t numTerms,
+    const uint64_t *linear, const uint64_t *squared) {
+  auto invalid = [&] { scalarPolynomialRegistrationValid = false; return false; };
+  if (initialized || equation >= getNumOfVectorizedEquations() ||
+      getDeclaredEquationFlatSize(equation) != 1 || !numVariables ||
+      numVariables > 64 || !variables || !numTerms || numTerms > 256 ||
+      !linear || !squared || scalarPolynomials.count(equation)) return invalid();
+  bool hasMatched = false;
+  for (uint64_t i = 0; i < numVariables; ++i) {
+    if (variables[i] >= getNumOfArrayVariables() ||
+        getVariableFlatSize(variables[i]) != 1) return invalid();
+    hasMatched |= variables[i] == matched;
+    for (uint64_t j = 0; j < i; ++j)
+      if (variables[j] == variables[i]) return invalid();
+  }
+  if (!hasMatched) return invalid();
+  const uint64_t whole = numVariables == 64 ? ~uint64_t(0)
+                                           : (uint64_t(1) << numVariables) - 1;
+  for (uint64_t i = 0; i < numTerms; ++i)
+    if ((linear[i] & squared[i]) || ((linear[i] | squared[i]) & ~whole))
+      return invalid();
+  if (!scalarPolynomialLimitRead) {
+    scalarPolynomialLimitRead = true;
+    if (const char *text = std::getenv("MARCO_C2_BLOCK_WORK_LIMIT")) {
+      char *end = nullptr;
+      auto limit = std::strtoull(text, &end, 10);
+      if (end == text || *end || *text == '-') limit = 0;
+      scalarPolynomialBudget.work =
+          std::min<uint64_t>(scalarPolynomialBudget.work, limit);
+    }
+  }
+  const uint64_t work = numVariables * numVariables + 2 * numTerms + 1;
+  const uint64_t bytes = sizeof(ScalarPolynomialDescriptorV1) + 128 +
+      numVariables * sizeof(Variable) + numTerms * sizeof(kinsol::ScalarBlockPlan::Term);
+  if (work > scalarPolynomialBudget.work || bytes > scalarPolynomialBudget.storage)
+    return true;
+  scalarPolynomialBudget.work -= work;
+  scalarPolynomialBudget.storage -= bytes;
+  ScalarPolynomialDescriptorV1 descriptor;
+  descriptor.matched = matched;
+  descriptor.variables.assign(variables, variables + numVariables);
+  descriptor.terms.reserve(numTerms);
+  for (uint64_t i = 0; i < numTerms; ++i)
+    descriptor.terms.push_back({linear[i], squared[i]});
+  scalarPolynomials.emplace(equation, std::move(descriptor));
+  return true;
+}
+
+bool IDAInstance::setScalarExplicitV1(Equation equation, Variable matched,
+                                    ResidualFunction function) {
+  auto invalid = [&] { scalarPolynomialRegistrationValid = false; return false; };
+  if (initialized || !function || equation >= getNumOfVectorizedEquations() ||
+      getDeclaredEquationFlatSize(equation) != 1 ||
+      matched >= getNumOfArrayVariables() || getVariableFlatSize(matched) != 1)
+    return invalid();
+  auto found = scalarPolynomials.find(equation);
+  // 中文：可选证明构造可能耗尽预算；没有证明就不能显式执行，应保留完整原 solver。
+  // Optional proof construction can exhaust its budget. No proof means no
+  // explicit execution; retain the complete original solver in that case.
+  if (found == scalarPolynomials.end()) return true;
+  auto &proof = found->second;
+  if (proof.matched != matched || proof.explicitValue) return invalid();
+  auto position = std::find(proof.variables.begin(), proof.variables.end(), matched);
+  if (position == proof.variables.end()) return invalid();
+  auto mask = uint64_t(1) << std::distance(proof.variables.begin(), position);
+  for (const auto &term : proof.terms)
+    if (term.squared & mask) return invalid();
+  if (proof.terms.size() + 1 > scalarPolynomialBudget.work) return true;
+  scalarPolynomialBudget.work -= proof.terms.size() + 1;
+  proof.explicitValue = function;
+  return true;
+}
+
+bool IDAInstance::setBatchJacobianSupportV1(
+    Equation equation, Variable variable, JacobianSupportFunctionV1 function,
+    uint64_t queryWork) {
+  auto invalid = [&] { batchJacobianRegistrationValid = false; return false; };
+  if (initialized || !function || !queryWork || queryWork > 1000000 ||
+      equation >= getNumOfVectorizedEquations() ||
+      variable >= getNumOfArrayVariables()) return invalid();
+  // 中文：setBatchJacobianFunctionV1 可以合法地放弃描述符存储；端点有效且仅可选账本耗尽时保留标量执行。
+  // setBatchJacobianFunctionV1 may legitimately decline descriptor storage.
+  // Valid endpoints with an exhausted optional ledger retain scalar execution.
+  if (!batchAnalysisWork && (equation >= batchJacobianFunctions.size() ||
+                            !batchJacobianFunctions[equation].function))
+    return true;
+  if (equation >= batchJacobianFunctions.size()) return invalid();
+  auto &plan = batchJacobianFunctions[equation];
+  if (!plan.function ||
+      std::find(plan.variables.begin(), plan.variables.end(), variable) ==
+          plan.variables.end()) return invalid();
+  for (const auto &entry : plan.supports)
+    if (entry.variable == variable) return invalid();
+  if (!chargeBatchAnalysis(plan.supports.size() + 1,
+          2 * (plan.supports.size() + 1) * sizeof(plan.supports.front())))
+    return true;
+  plan.supports.push_back({variable, function, queryWork});
+  return true;
+}
+
+// 中文：在初始化或结构变更时建立颜色与 scatter；计算支持集可更精确，物理 CSR 顺序仍保持。
+// English: Build colors and scatter at initialization or structural change; computation
+// support may be tighter while physical CSR ordering is retained.
+bool IDAInstance::prepareBatchJacobianPlans() {
+  if (threadPool.getNumOfThreads() != 1 || !constraintComponents.empty())
+    return true;
+  const uint64_t columns = getNumOfScalarVariables();
+  // 中文：在细化消耗剩余可选预算前先保留保守计划和工作区，细化失败不能禁用它们。
+  // Preserve conservative plans and workspace before spending the remaining
+  // optional ledger on refinement. A missed refinement cannot disable them.
+  for (bool refining : {false, true}) {
+  uint64_t maximumRows = 0;
+  for (Equation equation = 0; equation < batchJacobianFunctions.size(); ++equation) {
+    auto &registered = batchJacobianFunctions[equation];
+    BatchJacobianDescriptorV1 candidate;
+    if (refining) {
+      if (!registered.enabled || registered.supports.empty() ||
+          !chargeBatchAnalysis(registered.variables.size() + 1,
+                               registered.variables.size() * sizeof(Variable)))
+        continue;
+      candidate.function = registered.function;
+      candidate.count = registered.count;
+      candidate.variables = registered.variables;
+    }
+    auto &plan = refining ? candidate : registered;
+    if (marco::runtime::simulation::getOptions().profiling)
+      std::cerr << "[ida-batch-plan] equation=" << equation
+                << " refinement=" << refining
+                << " rows=" << plan.count
+                << " row_metadata_complete=" << plan.rowMetadataComplete
+                << " remaining_work=" << batchAnalysisWork
+                << " remaining_storage=" << batchAnalysisStorage << "\n";
+    if (!plan.function || !plan.rowMetadataComplete)
+      continue;
+    if (!chargeBatchAnalysis(columns + plan.count,
+          columns * (sizeof(std::vector<uint64_t>) + 3 * sizeof(int64_t)) +
+          plan.count * sizeof(std::vector<uint64_t>)))
+      continue;
+    std::vector<std::vector<uint64_t>> users(columns);
+    std::vector<int64_t> color(columns, -1), forbidden(columns, -1);
+    const uint64_t first = equationOffsets[equation];
+    bool available = true;
+    // 中文：该 mask 只细化计算；物理 CSR 条目及顺序仍与注册完全一致，被排除条目明确赋零。
+    // This mask refines computation only. Physical CSR entries and their order
+    // remain exactly as registered; excluded entries are explicitly zeroed.
+    std::vector<std::vector<uint8_t>> support;
+    if (refining) {
+      if (!chargeBatchAnalysis(plan.count,
+              plan.count * sizeof(std::vector<uint8_t>))) continue;
+      support.resize(plan.count);
+      uint64_t searchWork = 1;
+      for (size_t size = variableOffsets.size(); size; size >>= 1) ++searchWork;
+      for (uint64_t row = 0; row < plan.count && available; ++row) {
+        const auto &entries = jacobianMatrixData[first + row];
+        if (!chargeBatchAnalysis(entries.size() * (registered.supports.size() + searchWork),
+                                 entries.size())) {
+          available = false;
+          break;
+        }
+        support[row].reserve(entries.size());
+        for (const auto &entry : entries) {
+          if (entry.first < 0 || static_cast<uint64_t>(entry.first) >= columns)
+            return false;
+          auto upper = std::upper_bound(variableOffsets.begin(),
+                                        variableOffsets.end(), entry.first);
+          auto variable = std::distance(variableOffsets.begin(), upper) - 1;
+          int32_t possible = 1;
+          for (const auto &binding : registered.supports)
+            if (binding.variable == static_cast<uint64_t>(variable)) {
+              if (!chargeBatchAnalysis(binding.queryWork)) {
+                available = false;
+                break;
+              }
+              possible = binding.function(row, entry.first - variableOffsets[variable]);
+              break;
+            }
+          if (!available) break;
+          if (possible != 0 && possible != 1) return false;
+          support[row].push_back(possible);
+        }
+      }
+    }
+    auto supported = [&](uint64_t row, uint64_t entry) {
+      return support.empty() || support[row][entry] != 0;
+    };
+    for (uint64_t row = 0; row < plan.count && available; ++row) {
+      const auto &entries = jacobianMatrixData[first + row];
+      if (!chargeBatchAnalysis(entries.size(),
+                               2 * entries.size() * sizeof(uint64_t))) {
+        available = false;
+        break;
+      }
+      for (uint64_t position = 0; position < entries.size(); ++position) {
+        const auto &entry = entries[position];
+        if (entry.first < 0 || static_cast<uint64_t>(entry.first) >= columns)
+          return false;
+        if (supported(row, position)) users[entry.first].push_back(row);
+      }
+    }
+    // 中文：完整邻接列表相同的列构成可互换 clique，包含交错数组坐标。
+    //       哈希只定位候选，每个接受组都核对完整列表；按首列访问组、按标量顺序访问成员，保证着色确定性。
+    // Equal complete incidence lists identify a clique of interchangeable
+    // columns, including interleaved array coordinates. Hashes only locate
+    // candidates: every accepted group checks the full list. Visit groups by
+    // their first column and members in scalar order for deterministic coloring.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> candidates;
+    std::vector<std::vector<uint64_t>> groups;
+    for (uint64_t column = 0; column < columns && available; ++column) {
+      if (users[column].empty()) continue;
+      if (!chargeBatchAnalysis(users[column].size() + 1, 2 * sizeof(uint64_t))) {
+        available = false;
+        break;
+      }
+      uint64_t hash = 14695981039346656037ull;
+      for (uint64_t row : users[column])
+        hash = (hash ^ row) * 1099511628211ull;
+      auto found = candidates.find(hash);
+      uint64_t selectedGroup = groups.size();
+      if (found != candidates.end()) {
+        for (uint64_t index : found->second) {
+          if (!chargeBatchAnalysis(users[column].size() + 1)) {
+            available = false;
+            break;
+          }
+          if (users[column] == users[groups[index].front()]) {
+            selectedGroup = index;
+            break;
+          }
+        }
+      }
+      if (!available) break;
+      if (selectedGroup == groups.size()) {
+        if (!chargeBatchAnalysis(1, 128 + 2 * sizeof(groups.front()))) {
+          available = false;
+          break;
+        }
+        candidates[hash].push_back(selectedGroup);
+        groups.emplace_back();
+      }
+      groups[selectedGroup].push_back(column);
+    }
+    uint64_t colors = 0;
+    for (const auto &group : groups) {
+      if (!available) break;
+      const uint64_t column = group.front();
+      // 中文：所有成员在 clique 外具有相同邻居；只检查一次这些邻居，再为组内成员分配不同颜色。
+      // All members have exactly the same neighbors outside their own clique.
+      // Inspect those neighbors once and assign a different color to each member.
+      for (uint64_t row : users[column]) {
+        const auto &entries = jacobianMatrixData[first + row];
+        if (!chargeBatchAnalysis(entries.size())) {
+          available = false;
+          break;
+        }
+        for (uint64_t position = 0; position < entries.size(); ++position)
+          if (supported(row, position) && color[entries[position].first] >= 0)
+            forbidden[color[entries[position].first]] = column;
+      }
+      if (!available) break;
+      uint64_t selected = 0;
+      for (uint64_t member : group) {
+        while (selected < colors && forbidden[selected] == static_cast<int64_t>(column)) {
+          if (!chargeBatchAnalysis(1)) {
+            available = false;
+            break;
+          }
+          ++selected;
+        }
+        if (!available) break;
+        color[member] = selected;
+        colors = std::max(colors, ++selected);
+      }
+    }
+    // 中文：独立检查已接受行的颜色不变量；着色错误是内部缺陷，不能当作优化未命中或发布错误计划。
+    // Independently check the accepted row-color invariant; a coloring bug
+    // is not an optimization miss and must not publish an incorrect plan.
+    std::fill(forbidden.begin(), forbidden.end(), -1);
+    for (uint64_t row = 0; row < plan.count && available; ++row) {
+      const auto &entries = jacobianMatrixData[first + row];
+      if (!chargeBatchAnalysis(entries.size())) {
+        available = false;
+        break;
+      }
+      for (uint64_t position = 0; position < entries.size(); ++position) {
+        if (!supported(row, position)) continue;
+        const auto &entry = entries[position];
+        int64_t selected = color[entry.first];
+        if (selected < 0 || static_cast<uint64_t>(selected) >= columns ||
+            forbidden[selected] == static_cast<int64_t>(row))
+          return false;
+        forbidden[selected] = row;
+      }
+    }
+    if (!available || !colors ||
+        !chargeBatchAnalysis(columns, colors * sizeof(std::vector<uint64_t>) +
+                                           2 * columns * sizeof(uint64_t)))
+      continue;
+    plan.colors.resize(colors);
+    for (uint64_t column = 0; column < columns; ++column)
+      if (color[column] >= 0)
+        plan.colors[color[column]].push_back(column);
+    if (!chargeBatchAnalysis(plan.count, colors * sizeof(plan.scatter.front())))
+      continue;
+    plan.scatter.resize(colors);
+    for (uint64_t row = 0; row < plan.count; ++row) {
+      const auto &entries = jacobianMatrixData[first + row];
+      if (!chargeBatchAnalysis(entries.size(),
+              2 * entries.size() * sizeof(std::pair<uint64_t, uint64_t>))) {
+        available = false;
+        break;
+      }
+      for (uint64_t entry = 0; entry < entries.size(); ++entry) {
+        if (supported(row, entry))
+          plan.scatter[color[entries[entry].first]].emplace_back(row, entry);
+        else
+          plan.structuralZeros.emplace_back(row, entry);
+      }
+    }
+    if (!available) {
+      plan.colors.clear();
+      plan.scatter.clear();
+      plan.structuralZeros.clear();
+      continue;
+    }
+    plan.columnColors = std::move(color);
+    plan.offsets.reserve(plan.variables.size());
+    for (Variable variable : plan.variables)
+      plan.offsets.push_back(variableOffsets[variable]);
+    plan.enabled = true;
+    if (marco::runtime::simulation::getOptions().profiling)
+      std::cerr << "[ida-batch-support] equation=" << equation
+                << " predicates=" << (refining ? registered.supports.size() : 0)
+                << " pure_tangent=" << registered.pureTangent
+                << " structural_zeros=" << plan.structuralZeros.size()
+                << " colors=" << colors << " rows=" << plan.count
+                << " remaining_work=" << batchAnalysisWork << "\n";
+    maximumRows = std::max(maximumRows, plan.count);
+    if (refining) {
+      registered.columnColors = std::move(candidate.columnColors);
+      registered.colors = std::move(candidate.colors);
+      registered.scatter = std::move(candidate.scatter);
+      registered.offsets = std::move(candidate.offsets);
+      registered.structuralZeros = std::move(candidate.structuralZeros);
+    }
+  }
+  if (refining) break;
+  if (!maximumRows)
+    return true;
+  if (!chargeBatchAnalysis(1, (columns + 2 * maximumRows) * sizeof(double))) {
+    for (auto &plan : batchJacobianFunctions) {
+      plan.enabled = false;
+      plan.columnColors.clear();
+      plan.colors.clear();
+      plan.scatter.clear();
+      plan.offsets.clear();
+      plan.structuralZeros.clear();
+    }
+    return true;
+  }
+  batchDirection.resize(columns);
+  batchValues.resize(maximumRows);
+  batchBaseline.resize(maximumRows);
+  // 中文：保守计划及必需工作区已经存在，可选 preparation 不适配时不能禁用它们。
+  // Conservative plans and their mandatory workspace already exist. Optional
+  // preparation cannot disable them when it does not fit.
+  if (!prepareBatchPrimalStorage()) return false;
+  }
+  // 中文：标量后备或未认证 V1 方程族可能有可见副作用；此时 preparation 仅限同族的颜色遍历。
+  //       不能仅因时间相同就跨中间回调传递准备结果。
+  // A scalar fallback or uncertified V1 family may have observable effects.
+  // In that case keep preparation local to one family's color sweep, never
+  // transport it across intervening callbacks merely because time is equal.
+  batchPreparedAcrossFamilies =
+      batchJacobianFunctions.size() == getNumOfVectorizedEquations() &&
+      std::all_of(batchJacobianFunctions.begin(), batchJacobianFunctions.end(),
+          [](const auto &plan) { return plan.enabled && plan.pureTangent; });
+  return true;
+}
+
+// 中文：方向 seed 每颜色重置；只有已认证纯 tangent 路径可省零 seed baseline，准备值只属于当前回调。
+// English: Reset direction seeds per color; only certified pure tangent may omit the zero-seed
+// baseline, and prepared values belong to this callback.
+int IDAInstance::evaluateBatchJacobian(Equation equation, double time,
+                                       double alpha) {
+  auto &plan = batchJacobianFunctions[equation];
+  assert(plan.enabled);
+  if (plan.preparedGroup < batchPreparedGroups.size() && !batchPreparedAcrossFamilies) {
+    auto &ready = batchPreparedGroups[plan.preparedGroup].ready;
+    if (marco::runtime::simulation::getOptions().profiling)
+      epochPreparedPrimalValues += std::count(ready.begin(), ready.end(), uint8_t(1));
+    std::fill(ready.begin(), ready.end(), 0);
+  }
+  for (const auto &location : plan.structuralZeros)
+    jacobianMatrixData[equationOffsets[equation] + location.first]
+                      [location.second].second = 0;
+  std::fill(batchDirection.begin(), batchDirection.end(), 0);
+  auto evaluate = [&](double *output, bool baseline) {
+    if (marco::runtime::simulation::getOptions().profiling) {
+      ++epochBatchJacobianCalls;
+      epochBatchJacobianBaselines += baseline;
+    }
+    int result;
+    if (plan.preparedGroup < batchPreparedGroups.size()) {
+      if (!batchPreparedScopeActive || baseline) return -1;
+      auto &group = batchPreparedGroups[plan.preparedGroup];
+      result = plan.preparedFunction(time, alpha, batchDirection.data(),
+          plan.offsets.data(), output, plan.count, group.values.data(),
+          group.ready.data());
+    } else {
+      result = plan.function(time, alpha, batchDirection.data(),
+                             plan.offsets.data(), output, plan.count);
+    }
+    if (result)
+      return result < 0 ? -1 : 1;
+    for (uint64_t row = 0; row < plan.count; ++row)
+      if (!std::isfinite(output[row]))
+        return 1;
+    return 0;
+  };
+  if (!plan.pureTangent)
+    if (int result = evaluate(batchBaseline.data(), true))
+      return result;
+  for (uint64_t color = 0; color < plan.colors.size(); ++color) {
+    for (uint64_t column : plan.colors[color])
+      batchDirection[column] = 1;
+    if (int result = evaluate(batchValues.data(), false))
+      return result;
+    for (const auto &location : plan.scatter[color]) {
+      auto &entry = jacobianMatrixData[equationOffsets[equation] + location.first]
+                                      [location.second];
+      entry.second = plan.pureTangent ? batchValues[location.first]
+          : batchValues[location.first] - batchBaseline[location.first];
+      if (!std::isfinite(entry.second)) return 1;
+    }
+    for (uint64_t column : plan.colors[color])
+      batchDirection[column] = 0;
+  }
+  return 0;
 }
 
 void IDAInstance::addJacobianFunction(Equation equation, Variable variable,
                                       JacobianFunction jacobianFunction,
                                       uint64_t numOfSeeds,
                                       uint64_t *seedSizes) {
+  invalidateScalarPolynomial(equation);
+  invalidateBatchJacobian(equation);
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[IDA] Setting jacobian function for equation " << equation
               << " and variable " << variable << "\n"
@@ -4321,6 +5337,31 @@ bool IDAInstance::initialize() {
   // and IDA vectors/callbacks so certificate failures occur before a partially
   // executable solver state is exposed.
   assert(!initialized && "The IDA instance has already been initialized");
+
+  if (!scalarPolynomialRegistrationValid) {
+    std::cerr << "[IDA] Invalid V1 scalar polynomial registration" << std::endl;
+    return false;
+  }
+  if (!batchResidualRegistrationValid || !batchJacobianRegistrationValid) {
+    std::cerr << "[IDA] Invalid V1 batch callback registration" << std::endl;
+    return false;
+  }
+  for (size_t equation = 0; equation < batchResidualFunctions.size(); ++equation)
+    if (batchResidualFunctions[equation].function &&
+        (equation >= residualFunctions.size() || !residualFunctions[equation])) {
+      std::cerr << "[IDA] V1 batch residual requires its scalar callback"
+                << std::endl;
+      return false;
+    }
+
+  if (!std::isfinite(startTime) || !std::isfinite(endTime) ||
+      endTime < startTime ||
+      (getOptions().equidistantTimeGrid &&
+       (!std::isfinite(timeStep) || timeStep <= 0))) {
+    std::cerr << "[IDA] Invalid simulation interval or output time step"
+              << std::endl;
+    return false;
+  }
 
   if (getStage6GRuntimeProbeMode() == Stage6GRuntimeProbeMode::Invalid) {
     std::cerr << "[stage6g-runtime-probe] error=invalid_probe_mode expected="
@@ -4397,7 +5438,11 @@ bool IDAInstance::initialize() {
   }
 
   if (scalarEquationsNumber == 0) {
-    // IDA has nothing to solve.
+    // 中文：外层积分器可能为空，但认证局部约束仍依赖时间；通过既有局部 solver 完成初始化。
+    // The outer integrator may be empty while certified local constraints
+    // still depend on time. Initialize them with the existing local solver.
+    if (!refreshConstraintComponents(startTime))
+      return false;
     initialized = true;
     return true;
   }
@@ -4593,6 +5638,21 @@ bool IDAInstance::initialize() {
           computeJacobianColumns(eq, equationIndices.data());
 
       jacobianMatrixData[scalarEquationIndex].resize(jacobianColumns.size());
+      if (eq < batchJacobianFunctions.size() &&
+          batchJacobianFunctions[eq].function && constraintComponents.empty() &&
+          threadPool.getNumOfThreads() == 1) {
+        auto &plan = batchJacobianFunctions[eq];
+        if (!chargeBatchAnalysis(1 + jacobianColumns.size())) {
+          plan.rowMetadataComplete = false;
+        } else {
+          for (uint64_t i = 0; i < jacobianColumns.size(); ++i) {
+            const auto &[variable, indices] = jacobianColumns[i];
+            jacobianMatrixData[scalarEquationIndex][i].first =
+                variableOffsets[variable] +
+                getVariableFlatIndex(variablesDimensions[variable], indices);
+          }
+        }
+      }
       ++reservedScalarEquations;
       ++equationScalarEquations;
       reservedJacobianColumns += jacobianColumns.size();
@@ -4636,6 +5696,12 @@ bool IDAInstance::initialize() {
               << " jacobian_columns=" << reservedJacobianColumns
               << " elapsed_ms=" << elapsedMillisecondsSince(reservationStart)
               << std::endl;
+  }
+
+  if (!prepareBatchJacobianPlans()) {
+    std::cerr << "[IDA] Invalid V1 batch Jacobian structure or coloring"
+              << std::endl;
+    return false;
   }
 
   // Compute the total amount of non-zero values in the Jacobian Matrix.
@@ -4748,6 +5814,11 @@ bool IDAInstance::initialize() {
 }
 
 bool IDAInstance::calcIC() {
+  if (!validateBatchRegistration()) return false;
+  if (!scalarPolynomialRegistrationValid) {
+    std::cerr << "[IDA] Invalid or stale V1 scalar polynomial registration\n";
+    return false;
+  }
   if (!initialized) {
     if (!initialize()) {
       return false;
@@ -4759,8 +5830,10 @@ bool IDAInstance::calcIC() {
     return true;
   }
 
-  realtype firstOutTime =
+  realtype firstOutTime = startTime +
       (endTime - startTime) / getOptions().timeScalingFactorInit;
+  if (endTime > startTime && firstOutTime == startTime)
+    firstOutTime = std::nextafter(startTime, endTime);
 
   const bool runtimeProbe = isRuntimeIDAProbeEnabled();
   auto calcICStart = std::chrono::steady_clock::now();
@@ -5308,10 +6381,20 @@ void IDAInstance::printConstraintProbeSummary() const {
               << effectiveSuppressAlgebraicErrorTestSource << std::endl;
   }
 
+  printConstraintExecutionStatistics("[stage6g-runtime-probe]");
+}
+
+void IDAInstance::printConstraintExecutionStatistics(const char *prefix) const {
   for (const auto &execution : constraintComponentExecutions) {
     std::cerr << std::setprecision(17)
-              << "[stage6g-runtime-probe] summary execution_group="
+              << prefix << " summary execution_group="
               << execution->executionGroupId
+              << " instance=" << this << " basis_epoch=" << basisEpoch
+              << " created_basis_epoch=" << execution->createdBasisEpoch
+              << " state_set=" << execution->stateSetId
+              << " statistics_epoch=" << statisticsEpoch
+              << " solver_id=" << execution->solver->getStatisticsId()
+              << " scope=execution_lifetime_cumulative"
               << " semantic_components=";
     bool firstSemanticComponent = true;
     for (uint64_t semanticComponent : execution->semanticComponentIds) {
@@ -5330,11 +6413,36 @@ void IDAInstance::printConstraintProbeSummary() const {
               << " local_solve_fatal_failures="
               << execution->localSolveFatalFailures
               << " local_newton_iterations="
-              << execution->localNonlinearIterations
-              << " local_residual_peak="
-              << execution->maximumLocalResidual
-              << " local_residual_peak_time="
-              << execution->maximumLocalResidualTime
+              << execution->localNonlinearIterations;
+    if (marco::runtime::simulation::getOptions().profiling) {
+      std::cerr << " c2_function_norm_tolerance="
+                << getOptions().c2FunctionNormTolerance
+                << " c2_scaled_step_tolerance="
+                << getOptions().c2ScaledStepTolerance;
+      auto printResidual = [&](const char *phase, const auto &totals) {
+        std::cerr << " " << phase << "_residual_evaluations="
+                  << totals.evaluations << " " << phase
+                  << "_residual_nonfinite=" << totals.nonfinite
+                  << " " << phase << "_residual_max=" << totals.maximum
+                  << " " << phase << "_residual_scaled_max="
+                  << totals.scaledMaximum;
+      };
+      printResidual("pre", execution->preResidual);
+      printResidual("post", execution->postResidual);
+      printResidual("failed", execution->failedResidual);
+    }
+    // 中文：legacy constraint probe 会增加残差求值；普通 profile 不能把未被观察的默认零显示为实测残差范数。
+    // The legacy constraint probe evaluates extra residuals. Ordinary profile
+    // must not present its untouched default zero as an observed residual norm.
+    if (isStage6GRuntimeProbeEnabled()) {
+      std::cerr << " local_residual_peak=" << execution->maximumLocalResidual
+                << " local_residual_peak_time="
+                << execution->maximumLocalResidualTime;
+    } else {
+      std::cerr << " local_residual_peak=unavailable"
+                   " local_residual_peak_time=unavailable";
+    }
+    std::cerr << " local_residual_peak_source=extra_callback_constraint_probe"
               << " condition_peak=" << execution->maximumCondition
               << " condition_peak_time="
               << execution->maximumConditionTime
@@ -5356,12 +6464,19 @@ void IDAInstance::printConstraintProbeSummary() const {
               << " schur_factorizations="
               << execution->schurFactorizations
               << " schur_rhs_solves=" << execution->schurRightHandSides
+              << " schur_scalar_jacobian_calls="
+              << execution->schurScalarJacobianCalls
               << " schur_fill_entries=" << execution->schurFillEntries
               << std::endl;
   }
 }
 
 bool IDAInstance::step() {
+  if (!validateBatchRegistration()) return false;
+  if (!scalarPolynomialRegistrationValid) {
+    std::cerr << "[IDA] Invalid or stale V1 scalar polynomial registration\n";
+    return false;
+  }
   // 中文：无可切换 component 时保留 IDA_NORMAL 快路径；需要 probe 或状态切换时
   // 使用 IDA_ONE_STEP 保存 accepted checkpoints，并用 IDAGetDky 恢复原输出网格。
   // English: Models without switchable components retain the IDA_NORMAL fast
@@ -5373,15 +6488,30 @@ bool IDAInstance::step() {
     }
   }
 
+  if (currentTime >= endTime)
+    return true;
+
+  // 中文：输出网格始终锚定原始起始时间，跨 IDAReInit 也不重设；只截断最后一次输出请求。
+  //       内部自适应步进及既有 accepted-checkpoint/插值协议保持不变。
+  // The output grid is anchored at the original start time, including across
+  // IDAReInit. Only the last output request is clipped; internal adaptive steps
+  // and the existing accepted-checkpoint/interpolation protocol are unchanged.
+  const realtype tout = getOptions().equidistantTimeGrid
+      ? std::min(endTime, startTime + (stepsNumber + 1) * timeStep)
+      : endTime;
+  if (!std::isfinite(tout) || tout <= currentTime) {
+    std::cerr << "[IDA] Output time step cannot advance time" << std::endl;
+    return false;
+  }
+
   if (getNumOfScalarEquations() == 0) {
-    // IDA has nothing to solve. Just increment the time.
-
-    if (getOptions().equidistantTimeGrid) {
-      currentTime += timeStep;
-    } else {
-      currentTime = endTime;
-    }
-
+    // 中文：虽没有外层积分步，接受每个输出时间前仍必须重新计算局部代数约束。
+    // There is no outer integration step, but local algebraic constraints
+    // must be reevaluated at each output time before that time is accepted.
+    if (!refreshConstraintComponents(tout))
+      return false;
+    currentTime = tout;
+    ++stepsNumber;
     return true;
   }
 
@@ -5392,15 +6522,18 @@ bool IDAInstance::step() {
 
   ++stepsNumber;
 
-  realtype tout =
-      getOptions().equidistantTimeGrid ? (stepsNumber * timeStep) : endTime;
-
   int solveRetVal = IDA_SUCCESS;
+  // 中文：该资格只属于当前调用的控制流事实，不是按时间或模型地址缓存；每个新 step/trial/epoch 都从未认证状态开始。
+  // Local to this call: this is a control-flow fact, not a cache keyed by
+  // time or model address. Every new step/trial/epoch starts unqualified.
+  bool outputClosureCurrent = false;
   bool constraintProbe = isStage6GRuntimeProbeEnabled() &&
                          !constraintComponents.empty();
   bool stateSetStepping =
       !constraintStateSets.empty() || !constraintExecutionEpochs.empty();
   if (!constraintProbe && !stateSetStepping) {
+    if (marco::runtime::simulation::getOptions().profiling)
+      ++epochSolveCalls;
     solveRetVal = IDASolve(idaMemory, tout, &currentTime, variablesVector,
                            derivativesVector, IDA_NORMAL);
   } else {
@@ -5418,6 +6551,8 @@ bool IDAInstance::step() {
                   column.second.data()));
         }
       }
+      if (marco::runtime::simulation::getOptions().profiling)
+        ++epochSolveCalls;
       solveRetVal = IDASolve(idaMemory, tout, &internalTime, variablesVector,
                              derivativesVector, IDA_ONE_STEP);
       if (solveRetVal != IDA_SUCCESS && solveRetVal != IDA_TSTOP_RETURN &&
@@ -5494,6 +6629,12 @@ bool IDAInstance::step() {
       if (!refreshConstraintComponents(currentTime)) {
         return false;
       }
+      // 中文：从此处到公共尾部，除再次写入相同插值外层向量外，没有求解或模型修改。
+      //       probe 可以执行回调，因此启用 probe 时特意保留原刷新。
+      // From here to the common tail there is no solve or model mutation
+      // except writing these same interpolated outer vectors again. A probe
+      // can evaluate callbacks, so it deliberately keeps the original refresh.
+      outputClosureCurrent = !constraintProbe;
       if (constraintProbe &&
           !recordConstraintProbeSample("output", currentTime,
                                        variablesVector,
@@ -5576,7 +6717,7 @@ bool IDAInstance::step() {
   }
 
   copyVariablesIntoMARCO(variablesVector, derivativesVector);
-  if (!refreshConstraintComponents(currentTime)) {
+  if (!outputClosureCurrent && !refreshConstraintComponents(currentTime)) {
     return false;
   }
 
@@ -5590,9 +6731,10 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
                                   void *userData) {
   IDA_PROFILER_RESIDUALS_CALL_COUNTER_INCREMENT
   static std::atomic<uint64_t> residualCallCounter{0};
-  uint64_t residualCall = ++residualCallCounter;
   const bool runtimeProbe = isRuntimeIDAProbeEnabled();
-  auto residualStart = std::chrono::steady_clock::now();
+  uint64_t residualCall = runtimeProbe ? ++residualCallCounter : 0;
+  auto residualStart = runtimeProbe ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
 
   if (runtimeProbe) {
     std::cerr << "[ida-runtime-probe] residual begin call=" << residualCall
@@ -5601,6 +6743,9 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
 
   realtype *rval = N_VGetArrayPointer(residuals);
   auto *instance = static_cast<IDAInstance *>(userData);
+  if (!instance->validateBatchRegistration()) return -1;
+  if (marco::runtime::simulation::getOptions().profiling)
+    ++instance->epochResidualCalls;
 
   // 中文：先把 IDA 试探值写回 MARCO 数组并求解 local closure，随后 outer
   // residual 才读取完整一致状态。
@@ -5616,6 +6761,16 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
   // it writes into.
   IDA_PROFILER_RESIDUALS_START
 
+  // 中文：保持既有多 worker 和 C2 执行契约；串行时首行计算整个认证范围，后续行仅维持原遍历计数。
+  //       结果不跨系统回调保留，批量失败也不能回到部分更新后的标量执行。
+  // Preserve the existing multi-worker and C2 execution contracts. In the
+  // serial case the first row evaluates the entire certified range; later
+  // rows only account for the original traversal. No result survives this
+  // system callback, and a failed batch never falls back to scalar execution.
+  const bool useBatch = instance->threadPool.getNumOfThreads() == 1 &&
+                        instance->constraintComponents.empty();
+  int batchStatus = 0;
+
   instance->equationsParallelIteration(
       EquationsParallelIterationKind::Residuals,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
@@ -5629,14 +6784,41 @@ int IDAInstance::residualFunction(realtype time, N_Vector variables,
 
         uint64_t offset = equationArrayOffset + equationScalarOffset;
 
+        if (useBatch && eq < instance->batchResidualFunctions.size()) {
+          const auto &batch = instance->batchResidualFunctions[eq];
+          if (batch.function) {
+            if (batchStatus || equationScalarOffset != 0)
+              return;
+            if (marco::runtime::simulation::getOptions().profiling)
+              ++instance->epochBatchResidualCalls;
+            batchStatus = batch.function(time, rval + equationArrayOffset,
+                                         batch.count);
+            if (!batchStatus) {
+              for (uint64_t i = 0; i < batch.count; ++i)
+                if (!std::isfinite(rval[equationArrayOffset + i])) {
+                  batchStatus = 1;
+                  break;
+                }
+            }
+            return;
+          }
+        }
+        if (batchStatus)
+          return;
+
         auto residualFn = instance->residualFunctions[eq];
         auto *eqIndicesPtr = equationIndices.data();
 
+        if (marco::runtime::simulation::getOptions().profiling)
+          ++instance->epochScalarResidualCalls;
         auto residualFunctionResult = residualFn(time, eqIndicesPtr);
         *(rval + offset) = residualFunctionResult;
       });
 
   IDA_PROFILER_RESIDUALS_STOP
+
+  if (batchStatus)
+    return batchStatus < 0 ? -1 : 1;
 
   if (runtimeProbe) {
     std::cerr << "[ida-runtime-probe] residual done call=" << residualCall
@@ -5664,9 +6846,10 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
                                 N_Vector tempv2, N_Vector tempv3) {
   IDA_PROFILER_PARTIAL_DERIVATIVES_CALL_COUNTER_INCREMENT
   static std::atomic<uint64_t> jacobianCallCounter{0};
-  uint64_t jacobianCall = ++jacobianCallCounter;
   const bool runtimeProbe = isRuntimeIDAProbeEnabled();
-  auto jacobianStart = std::chrono::steady_clock::now();
+  uint64_t jacobianCall = runtimeProbe ? ++jacobianCallCounter : 0;
+  auto jacobianStart = runtimeProbe ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
 
   if (runtimeProbe) {
     std::cerr << "[ida-runtime-probe] jacobian begin call=" << jacobianCall
@@ -5675,6 +6858,30 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
 
   realtype *jacobian = SUNSparseMatrix_Data(jacobianMatrix);
   auto *instance = static_cast<IDAInstance *>(userData);
+  if (!instance->validateBatchRegistration()) return -1;
+  // 中文：数值不能跨该作用域存活；同实例重入在写模型状态前拒绝，不同实例各有独立工作区。
+  //       异常和所有失败路径都会释放作用域。
+  // No numerical value may survive this scope. A reentrant call on this same
+  // instance is rejected before writing model state; different instances own
+  // independent workspaces. Exceptions and every failure path release it.
+  if (instance->batchPreparedScopeActive) return -1;
+  struct PreparedScope {
+    IDAInstance *owner;
+    explicit PreparedScope(IDAInstance *owner) : owner(owner) {
+      owner->batchPreparedScopeActive = !owner->batchPreparedGroups.empty();
+      for (auto &group : owner->batchPreparedGroups)
+        std::fill(group.ready.begin(), group.ready.end(), 0);
+    }
+    ~PreparedScope() {
+      if (marco::runtime::simulation::getOptions().profiling)
+        for (auto &group : owner->batchPreparedGroups)
+          owner->epochPreparedPrimalValues +=
+              std::count(group.ready.begin(), group.ready.end(), uint8_t(1));
+      owner->batchPreparedScopeActive = false;
+    }
+  } preparedScope(instance);
+  if (marco::runtime::simulation::getOptions().profiling)
+    ++instance->epochJacobianCalls;
 
   // 中文：Jacobian 使用同一 local closure 状态，普通 AD 先生成 direct outer
   // 项，再由 applyConstraintSchur 加入局部变量的隐式响应。
@@ -5691,6 +6898,7 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
   // matrix.
   IDA_PROFILER_PARTIAL_DERIVATIVES_START
 
+  int batchStatus = 0;
   instance->equationsParallelIteration(
       EquationsParallelIterationKind::Jacobian,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
@@ -5699,6 +6907,17 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
 
         uint64_t equationScalarOffset =
             getEquationFlatIndex(equationIndices, instance->equationRanges[eq]);
+
+        if (eq < instance->batchJacobianFunctions.size() &&
+            instance->batchJacobianFunctions[eq].enabled) {
+          // 中文：只有单 worker、非 C2 实例发布可用计划；失败回调必须传播，不能在数值状态已部分更新时静默重试标量路线。
+          // Only single-worker, non-C2 instances publish an enabled plan.
+          // A failed callback propagates; it must never silently retry through
+          // the scalar path with partially updated numeric state.
+          if (!batchStatus && equationScalarOffset == 0)
+            batchStatus = instance->evaluateBatchJacobian(eq, time, alpha);
+          return;
+        }
 
         uint64_t scalarEquationIndex =
             equationArrayOffset + equationScalarOffset;
@@ -5734,6 +6953,8 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
             assert(seedsMapIt != jacobianSeedsMap.end());
             assert(jacobianFunction != nullptr);
 
+            if (marco::runtime::simulation::getOptions().profiling)
+              ++instance->epochScalarJacobianCalls;
             jacobianFunctionResult = jacobianFunction(
                 time, equationIndices.data(), variableIndices.data(), alpha,
                 instance->memoryPoolId, seedsMapIt->second.data());
@@ -5749,7 +6970,13 @@ int IDAInstance::jacobianMatrix(realtype time, realtype alpha,
         }
       });
 
+  if (batchStatus) {
+    IDA_PROFILER_PARTIAL_DERIVATIVES_STOP
+    return batchStatus;
+  }
+
   if (!instance->applyConstraintSchur(time, alpha)) {
+    IDA_PROFILER_PARTIAL_DERIVATIVES_STOP
     return -1;
   }
 
@@ -5846,10 +7073,21 @@ uint64_t IDAInstance::getEquationFlatSize(Equation equation) const {
   if (isLocalEquation(equation)) {
     return 0;
   }
+  return getDeclaredEquationFlatSize(equation);
+}
+
+uint64_t IDAInstance::getDeclaredEquationFlatSize(Equation equation) const {
+  assert(equation < getNumOfVectorizedEquations());
   uint64_t result = 1;
 
   for (const Range &range : equationRanges[equation]) {
-    result *= range.end - range.begin;
+    if (range.end <= range.begin)
+      return 0;
+    const uint64_t extent = static_cast<uint64_t>(range.end) -
+                            static_cast<uint64_t>(range.begin);
+    if (result > std::numeric_limits<uint64_t>::max() / extent)
+      return 0;
+    result *= extent;
   }
 
   return result;
@@ -5991,30 +7229,11 @@ IDAInstance::computeAccessedJacobianColumns(
     }
   }
 
-  std::vector<JacobianColumn> orderedColumns;
-
-  for (const JacobianColumn &column : uniqueColumns) {
-    orderedColumns.push_back(column);
-  }
-
-  std::sort(orderedColumns.begin(), orderedColumns.end(),
-            [](const JacobianColumn &first, const JacobianColumn &second) {
-              if (first.first != second.first) {
-                return first.first < second.first;
-              }
-
-              assert(first.second.size() == second.second.size());
-
-              for (size_t i = 0, e = first.second.size(); i < e; ++i) {
-                if (first.second[i] < second.second[i]) {
-                  return true;
-                }
-              }
-
-              return false;
-            });
-
-  return orderedColumns;
+  // 中文：set 已按变量和索引元组字典序排序；逐轴“任一轴更小”的比较不构成严格弱序，会让两方向同时小于。
+  // The set already orders (variable, index tuple) lexicographically.
+  // Re-sorting with a per-axis "any less" comparison is not a strict weak
+  // order: both (0,1)<(1,0) and its reverse would compare true.
+  return {uniqueColumns.begin(), uniqueColumns.end()};
 }
 
 std::vector<JacobianColumn>
@@ -6353,14 +7572,15 @@ void IDAInstance::equationsParallelIteration(
   std::atomic_size_t chunkIndex = 0;
   const auto &simulationOptions = marco::runtime::simulation::getOptions();
   bool collectStats = simulationOptions.debug || simulationOptions.profiling;
-  std::vector<profiling::ParallelThreadWorkStats> threadWork(numOfThreads);
-  std::vector<std::thread::id> threadIds(numOfThreads);
+  std::vector<profiling::ParallelThreadWorkStats> threadWork(
+      collectStats ? numOfThreads : 0);
+  std::vector<std::thread::id> threadIds(collectStats ? numOfThreads : 0);
   const bool runtimeProbe = isRuntimeIDAProbeEnabled();
-  auto iterationStart = std::chrono::steady_clock::now();
+  auto iterationStart = runtimeProbe ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   std::atomic<uint64_t> processedScalarEquations{0};
 
-  for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
-    threadPool.async([&, thread]() {
+  auto job = [&](unsigned int thread) {
       if (collectStats) {
         threadIds[thread] = std::this_thread::get_id();
       }
@@ -6414,10 +7634,31 @@ void IDAInstance::equationsParallelIteration(
         } while (advanceEquationIndicesUntil(
             equationIndices, equationRanges[equation], std::get<2>(chunk)));
       }
-    });
-  }
+  };
 
-  threadPool.wait();
+  if (numOfThreads == 1) {
+    // 中文：单 worker 在调用线程及其 TLS 中执行，保留相同 chunk/seed，仅省去每次回调的队列交接。
+    // A single worker uses the caller's thread (and TLS). Keep exactly the
+    // same chunks and seeds, without a queue hand-off for each callback.
+#ifdef THREADS_ENABLE
+    try {
+      job(0);
+    } catch (...) {
+      // 中文：原 worker 线程中的未捕获异常同样导致终止，保持该语义。
+      // An uncaught exception on the former worker thread terminated too.
+      std::terminate();
+    }
+#else
+    // 中文：未启用线程的构建中，ThreadPool::async 会传播异常。
+    // ThreadPool::async propagates exceptions in non-threaded builds.
+    job(0);
+#endif
+  } else {
+    for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
+      threadPool.async([&, thread]() { job(thread); });
+    }
+    threadPool.wait();
+  }
 
   if (runtimeProbe) {
     std::cerr << "[ida-runtime-probe] " << getParallelIterationKindName(kind)
@@ -6483,20 +7724,44 @@ void IDAInstance::printStatistics() const {
     return;
   }
 
-  long nst, nre, nje, nni, nli, netf, nncf;
-  realtype ais, ls;
+  if (marco::runtime::simulation::getOptions().profiling)
+    std::cerr << "[ida-call-statistics] instance=" << this
+              << " epoch=" << statisticsEpoch << " scope=epoch_cumulative"
+              << " IDASolve_calls=" << epochSolveCalls
+              << " system_residual_calls=" << epochResidualCalls
+              << " system_jacobian_calls=" << epochJacobianCalls
+              << " scalar_residual_calls=" << epochScalarResidualCalls.load()
+              << " batch_residual_calls=" << epochBatchResidualCalls
+              << " batch_jacobian_calls=" << epochBatchJacobianCalls
+              << " batch_jacobian_baselines=" << epochBatchJacobianBaselines
+              << " prepared_primal_values=" << epochPreparedPrimalValues
+              << " scalar_jacobian_calls=" << epochScalarJacobianCalls.load()
+              << " scalar_scope=registered_equation_iteration"
+              << " schur_scalar_jacobian_calls=" << epochSchurJacobianCalls
+              << " candidate_scalar_residual_calls=" << epochCandidateResidualCalls
+              << " probe_extra_scalar_residual_calls=" << epochProbeResidualCalls
+              << '\n';
 
-  IDAGetNumSteps(idaMemory, &nst);
-  IDAGetNumResEvals(idaMemory, &nre);
-  IDAGetNumJacEvals(idaMemory, &nje);
-  IDAGetNumNonlinSolvIters(idaMemory, &nni);
-  IDAGetNumLinIters(idaMemory, &nli);
-  IDAGetNumErrTestFails(idaMemory, &netf);
-  IDAGetNumNonlinSolvConvFails(idaMemory, &nncf);
-  IDAGetActualInitStep(idaMemory, &ais);
-  IDAGetLastStep(idaMemory, &ls);
+  long nst = 0, nre = 0, nje = 0, nni = 0, nli = 0, netf = 0, nncf = 0,
+       nsetups = 0;
+  realtype ais = 0, ls = 0;
 
-  std::cerr << std::endl << "Final Run Statistics:" << std::endl;
+  if (!initialized || !idaMemory ||
+      IDAGetNumSteps(idaMemory, &nst) != IDA_SUCCESS ||
+      IDAGetNumResEvals(idaMemory, &nre) != IDA_SUCCESS ||
+      IDAGetNumJacEvals(idaMemory, &nje) != IDA_SUCCESS ||
+      IDAGetNumNonlinSolvIters(idaMemory, &nni) != IDA_SUCCESS ||
+      IDAGetNumLinIters(idaMemory, &nli) != IDA_SUCCESS ||
+      IDAGetNumErrTestFails(idaMemory, &netf) != IDA_SUCCESS ||
+      IDAGetNumNonlinSolvConvFails(idaMemory, &nncf) != IDA_SUCCESS ||
+      IDAGetNumLinSolvSetups(idaMemory, &nsetups) != IDA_SUCCESS ||
+      IDAGetActualInitStep(idaMemory, &ais) != IDA_SUCCESS ||
+      IDAGetLastStep(idaMemory, &ls) != IDA_SUCCESS) {
+    std::cerr << "[ida-statistics] status=unavailable" << std::endl;
+    return;
+  }
+
+  std::cerr << std::endl << "SUNDIALS Current Epoch Statistics:" << std::endl;
 
   std::cerr << "Number of vector equations       = ";
   std::cerr << getNumOfVectorizedEquations() << std::endl;
@@ -6511,6 +7776,7 @@ void IDAInstance::printStatistics() const {
 
   std::cerr << "Number of nonlinear iterations   = " << nni << std::endl;
   std::cerr << "Number of linear iterations      = " << nli << std::endl;
+  std::cerr << "Number of linear solver setups   = " << nsetups << std::endl;
   std::cerr << "Number of error test failures    = " << netf << std::endl;
   std::cerr << "Number of nonlin. conv. failures = " << nncf << std::endl;
 
@@ -7544,6 +8810,81 @@ static void idaSetResidual_void(void *instance, uint64_t equationIndex,
 }
 
 RUNTIME_FUNC_DEF(idaSetResidual, void, PTR(void), uint64_t, PTR(void))
+
+// 中文：V1 为附加接口，已有生成程序继续使用原标量 ABI。
+// V1 is additive: existing generated programs keep their scalar ABI.
+static void idaSetBatchResidualV1_void(void *instance, uint64_t equation,
+                                       uint64_t count, void *function) {
+  static_cast<IDAInstance *>(instance)->setBatchResidualFunctionV1(
+      equation, count, reinterpret_cast<BatchResidualFunctionV1>(function));
+}
+
+RUNTIME_FUNC_DEF(idaSetBatchResidualV1, void, PTR(void), uint64_t, uint64_t,
+                 PTR(void))
+
+static void idaSetBatchJacobianV1_void(void *instance, uint64_t equation,
+                                      uint64_t count, void *function,
+                                      uint64_t numVariables,
+                                      uint64_t *variables) {
+  static_cast<IDAInstance *>(instance)->setBatchJacobianFunctionV1(
+      equation, count, reinterpret_cast<BatchJacobianFunctionV1>(function),
+      numVariables, variables);
+}
+
+RUNTIME_FUNC_DEF(idaSetBatchJacobianV1, void, PTR(void), uint64_t, uint64_t,
+                 PTR(void), uint64_t, PTR(uint64_t))
+
+static void idaSetBatchTangentV2_void(
+    void *instance, uint64_t equation, uint64_t count, void *function,
+    uint64_t numVariables, uint64_t *variables) {
+  static_cast<IDAInstance *>(instance)->setBatchTangentFunctionV2(
+      equation, count, reinterpret_cast<BatchJacobianFunctionV1>(function),
+      numVariables, variables);
+}
+
+RUNTIME_FUNC_DEF(idaSetBatchTangentV2, void, PTR(void), uint64_t, uint64_t,
+                 PTR(void), uint64_t, PTR(uint64_t))
+
+static void idaSetBatchPreparedTangentV3_void(
+    void *instance, uint64_t equation, uint64_t count, void *function,
+    void *layout, uint64_t slots) {
+  static_cast<IDAInstance *>(instance)->setBatchPreparedTangentV3(
+      equation, count, reinterpret_cast<BatchPreparedTangentFunctionV3>(function),
+      layout, slots);
+}
+
+RUNTIME_FUNC_DEF(idaSetBatchPreparedTangentV3, void, PTR(void), uint64_t,
+                 uint64_t, PTR(void), PTR(void), uint64_t)
+
+static void idaSetScalarPolynomialV1_void(
+    void *instance, uint64_t equation, uint64_t matched, uint64_t numVariables,
+    uint64_t *variables, uint64_t numTerms, uint64_t *linear, uint64_t *squared) {
+  static_cast<IDAInstance *>(instance)->setScalarPolynomialV1(
+      equation, matched, numVariables, variables, numTerms, linear, squared);
+}
+
+RUNTIME_FUNC_DEF(idaSetScalarPolynomialV1, void, PTR(void), uint64_t, uint64_t,
+                 uint64_t, PTR(uint64_t), uint64_t, PTR(uint64_t), PTR(uint64_t))
+
+static void idaSetScalarExplicitV1_void(void *instance, uint64_t equation,
+                                      uint64_t matched, void *function) {
+  static_cast<IDAInstance *>(instance)->setScalarExplicitV1(
+      equation, matched, reinterpret_cast<ResidualFunction>(function));
+}
+
+RUNTIME_FUNC_DEF(idaSetScalarExplicitV1, void, PTR(void), uint64_t, uint64_t,
+                 PTR(void))
+
+static void idaSetBatchJacobianSupportV1_void(void *instance, uint64_t equation,
+                                           uint64_t variable, void *function,
+                                           uint64_t queryWork) {
+  static_cast<IDAInstance *>(instance)->setBatchJacobianSupportV1(
+      equation, variable,
+      reinterpret_cast<IDAInstance::JacobianSupportFunctionV1>(function), queryWork);
+}
+
+RUNTIME_FUNC_DEF(idaSetBatchJacobianSupportV1, void, PTR(void), uint64_t, uint64_t,
+                 PTR(void), uint64_t)
 
 //===---------------------------------------------------------------------===//
 // idaAddJacobian

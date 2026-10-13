@@ -4,6 +4,8 @@
 #ifdef SUNDIALS_ENABLE
 
 #include "ida/ida.h"
+#include "marco/Runtime/Solvers/KINSOL/ScalarBlockPlan.h"
+#include "marco/Runtime/Solvers/IDA/C2KernelV1.h"
 #include "marco/Runtime/Solvers/SUNDIALS/DiscontinuityCoordinator.h"
 #include "marco/Runtime/Solvers/SUNDIALS/Instance.h"
 #include "nvector/nvector_serial.h"
@@ -11,6 +13,7 @@
 #include "sundials/sundials_types.h"
 #include "sunlinsol/sunlinsol_klu.h"
 #include "sunmatrix/sunmatrix_sparse.h"
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,6 +29,42 @@ enum class VariableKind { ALGEBRAIC, STATE };
 /// The 2nd argument is a pointer to the list of equation indices.
 /// The result is the residual value.
 using ResidualFunction = double (*)(double, const int64_t *);
+
+/// Optional V1 whole-family callback. The compiler certifies a pure evaluation
+/// of exactly the registered range, in its canonical row-major order. Every
+/// call writes count fresh values; it must not retain the output pointer or
+/// reuse numeric state from another call. Return 0, positive (recoverable), or
+/// negative (fatal), as for an IDA residual callback.
+// 中文：批量回调返回状态码并覆盖登记的整组行；不能发布只有部分行成功的结果。
+// English: Batch callbacks return a status and cover the complete registered row group;
+// partial success must not be published.
+using BatchResidualFunctionV1 = int32_t (*)(double, double *, uint64_t);
+
+/// 中文：可选 V1 批量前向 AD 使用当前 IDA 标量变量顺序，offset 绑定显式注册变量句柄，并为每个方程族行返回新值。
+///       V1 保留零方向 baseline，以 P(v)-P(0) 计算 Jv；任何数值，包括零 baseline，都不能跨系统 Jacobian 回调保留。
+/// Optional V1 batched forward-AD template. The direction uses the current
+/// IDA scalar-variable ordering; offsets bind the explicitly registered
+/// variable handles to that ordering. Return one fresh value per family row.
+/// V1 retains the existing zero-direction baseline: J*v is P(v)-P(0).
+/// Nothing, including a zero baseline, survives a system Jacobian callback.
+using BatchJacobianFunctionV1 = int32_t (*)(double, double, const double *,
+                                           const uint64_t *, double *, uint64_t);
+
+/// V3 extends a registered V2 tangent with private, lazy primal preparation.
+/// The final arrays have the registered number of scalar slots. A zero ready
+/// byte means unprepared; publish it only after writing the corresponding value.
+/// Only certified direction-independent pure operations may be shared. The
+/// layout identity certifies identical expressions and input/iteration mappings
+/// across participating families, not merely a hash. Pointers never escape.
+/// Values, including nonfinite intermediates, retain the original semantics;
+/// output validation is unchanged. All ready bytes start at zero for EVERY
+/// system Jacobian, including failed trials and repeated calls at equal time.
+// 中文：V3 工作区由实例持有，准备标志仅在一次系统 Jacobian 求值期间有效；布局相同不代表数值仍有效。
+// English: The instance owns V3 workspace; preparation is valid only for one system Jacobian
+// evaluation, and equal layout does not imply valid values.
+using BatchPreparedTangentFunctionV3 = int32_t (*)(
+    double, double, const double *, const uint64_t *, double *, uint64_t,
+    double *, uint8_t *);
 
 /// Signature of Jacobian functions.
 /// The 1st argument is the current time.
@@ -325,6 +364,9 @@ bool composeExecutionGroupDerivative(
 /// English: An IDA instance coordinates outer integration, component-local
 /// sparse closures, accepted checkpoints, and discontinuity transactions
 /// shared by model events and state-basis switches.
+/// With one effective worker, equation callbacks execute on the caller thread
+/// and observe its TLS. Multiple workers keep pool-thread execution. This does
+/// not make one solver instance concurrently callable or reentrant.
 class IDAInstance {
 public:
   IDAInstance();
@@ -449,6 +491,49 @@ public:
   void setResidualFunction(Equation equationIndex,
                            ResidualFunction residualFunction);
 
+  /// 中文：这是附加优化契约，标量回调仍必需。V1 仅在单 worker 且无 C2 描述符时使用调用线程。
+  ///       重复或无效注册在 initialize() 分配前失败。
+  /// Additive optimization contract; the scalar callback remains mandatory.
+  /// V1 uses the calling thread only with one worker and no C2 descriptors.
+  /// Invalid or duplicate registrations fail initialize(), before allocation.
+  bool setBatchResidualFunctionV1(Equation equation, uint64_t count,
+                                   BatchResidualFunctionV1 function);
+
+  bool setBatchJacobianFunctionV1(Equation equation, uint64_t count,
+                                  BatchJacobianFunctionV1 function,
+                                  uint64_t numVariables,
+                                  const uint64_t *variables);
+
+  /// 中文：V2 直接返回齐次 tangent F_y·v+alpha·F_yp·v，结果不再携带与 seed 无关的 baseline。
+  /// V2 supplies the homogeneous tangent F_y*v + alpha*F_yp*v itself.
+  /// Unlike V1 there is no seed-independent baseline in its result.
+  bool setBatchTangentFunctionV2(Equation equation, uint64_t count,
+                                BatchJacobianFunctionV1 function,
+                                uint64_t numVariables,
+                                const uint64_t *variables);
+
+  bool setBatchPreparedTangentV3(Equation equation, uint64_t count,
+                               BatchPreparedTangentFunctionV3 function,
+                               const void *layoutIdentity, uint64_t slots);
+
+  /// 中文：按注册的扁平行/变量顺序提供认证计算 support：已证明结构零返回 0，可能非零返回 1。
+  /// Certified computation support in registered flat row/variable order.
+  /// Returns 0 for a proven structural zero, 1 for a possible nonzero.
+  using JacobianSupportFunctionV1 = int32_t (*)(uint64_t, uint64_t);
+  bool setBatchJacobianSupportV1(Equation equation, Variable variable,
+                                JacobianSupportFunctionV1 function,
+                                uint64_t queryWork);
+
+  bool setScalarPolynomialV1(Equation equation, Variable matched,
+      uint64_t numVariables, const uint64_t *variables, uint64_t numTerms,
+      const uint64_t *linear, const uint64_t *squared);
+
+  /// 中文：可选唯一标量解由编译器现有显式化规则隔离，要求相同多项式证明与实际配对。
+  /// Optional unique scalar solution, isolated by the compiler's existing
+  /// explicitation rules. Requires the same polynomial proof and pairing.
+  bool setScalarExplicitV1(Equation equation, Variable matched,
+                           ResidualFunction function);
+
   /// Add the function pointer that computes a partial derivative of an
   /// equation.
   void addJacobianFunction(Equation equationIndex, Variable variableIndex,
@@ -504,6 +589,17 @@ public:
                             N_Vector tempv1, N_Vector tempv2, N_Vector tempv3);
 
 private:
+  bool chargeBatchAnalysis(uint64_t work, uint64_t storage = 0);
+public:
+  bool registerC2KernelV1(const MarcoC2KernelV1 &descriptor);
+private:
+  struct C2KernelRegistration;
+  std::map<std::tuple<uint64_t, uint64_t, uint64_t>,
+           std::unique_ptr<C2KernelRegistration>> c2Kernels;
+  uint64_t c2KernelRows{0};
+  bool prepareBatchJacobianPlans();
+  int evaluateBatchJacobian(Equation equation, double time, double alpha);
+
   [[nodiscard]] uint64_t getNumOfArrayVariables() const;
 
   [[nodiscard]] uint64_t getNumOfScalarVariables() const;
@@ -519,6 +615,7 @@ private:
   [[nodiscard]] uint64_t getEquationRank(Equation equation) const;
 
   [[nodiscard]] uint64_t getEquationFlatSize(Equation equation) const;
+  [[nodiscard]] uint64_t getDeclaredEquationFlatSize(Equation equation) const;
 
   [[nodiscard]] uint64_t getVariableRank(Variable variable) const;
 
@@ -573,11 +670,16 @@ private:
                                    N_Vector variables,
                                    N_Vector derivatives);
   void printConstraintProbeSummary() const;
+  void printConstraintExecutionStatistics(const char *prefix) const;
 
   struct ConstraintComponentExecutionRuntime;
   bool validateConstraintStateSetRegistrations();
   bool prepareConstraintComponentExecutions();
   int solveConstraintComponents(realtype time);
+  template <bool Generated> int solveConstraintComponentsBody(realtype time);
+  using ConstraintSolveEntry = int (IDAInstance::*)(realtype);
+  ConstraintSolveEntry constraintSolveEntry =
+      &IDAInstance::solveConstraintComponentsBody<false>;
   bool refreshConstraintComponents(realtype time);
   bool evaluateConstraintJacobian(
       ConstraintComponentExecutionRuntime &execution, Equation equation,
@@ -730,6 +832,17 @@ private:
   uint64_t basisEpoch{0};
   uint64_t basisSwitchCount{0};
   uint64_t idaReInitCount{0};
+  uint64_t statisticsEpoch{0};
+  uint64_t epochSolveCalls{0}, epochResidualCalls{0}, epochJacobianCalls{0};
+  std::atomic<uint64_t> epochScalarResidualCalls{0};
+  uint64_t epochBatchResidualCalls{0};
+  uint64_t epochBatchJacobianCalls{0};
+  uint64_t epochBatchJacobianBaselines{0};
+  uint64_t epochPreparedPrimalValues{0};
+  std::atomic<uint64_t> epochScalarJacobianCalls{0};
+  uint64_t epochSchurJacobianCalls{0};
+  uint64_t epochCandidateResidualCalls{0};
+  uint64_t epochProbeResidualCalls{0};
   bool verifyFirstOrderAfterReInit{false};
   IDARestartRecoveryState restartRecovery;
   SolverDiscontinuityCoordinator discontinuityCoordinator;
@@ -770,6 +883,66 @@ private:
   // i-th equation.
   std::vector<ResidualFunction> residualFunctions;
 
+  struct BatchResidualDescriptorV1 {
+    BatchResidualFunctionV1 function{nullptr};
+    uint64_t count{0};
+  };
+  std::vector<BatchResidualDescriptorV1> batchResidualFunctions;
+  bool batchResidualRegistrationValid{true};
+
+  struct BatchJacobianDescriptorV1 {
+    BatchJacobianFunctionV1 function{nullptr};
+    bool pureTangent{false};
+    BatchPreparedTangentFunctionV3 preparedFunction{nullptr};
+    const void *preparedIdentity{nullptr};
+    uint64_t preparedSlots{0};
+    size_t preparedGroup{static_cast<size_t>(-1)};
+    uint64_t count{0};
+    std::vector<Variable> variables;
+    std::vector<uint64_t> offsets;
+    std::vector<int64_t> columnColors;
+    std::vector<std::vector<uint64_t>> colors;
+    // 中文：记录原物理行及条目索引，不改变矩阵布局。
+    // Original physical row and entry index; no matrix layout changes.
+    std::vector<std::vector<std::pair<uint64_t, uint64_t>>> scatter;
+    struct Support {
+      Variable variable;
+      JacobianSupportFunctionV1 function;
+      uint64_t queryWork;
+    };
+    std::vector<Support> supports;
+    std::vector<std::pair<uint64_t, uint64_t>> structuralZeros;
+    bool rowMetadataComplete{true};
+    bool enabled{false};
+  };
+  std::vector<BatchJacobianDescriptorV1> batchJacobianFunctions;
+  void invalidateBatchJacobian(Equation equation);
+  bool validateBatchRegistration() const;
+  struct ScalarPolynomialDescriptorV1 {
+    Variable matched;
+    std::vector<Variable> variables;
+    std::vector<kinsol::ScalarBlockPlan::Term> terms;
+    ResidualFunction explicitValue{nullptr};
+  };
+  std::map<Equation, ScalarPolynomialDescriptorV1> scalarPolynomials;
+  void invalidateScalarPolynomial(Equation equation);
+  kinsol::ScalarBlockPlan::Budget scalarPolynomialBudget;
+  bool scalarPolynomialLimitRead{false};
+  bool scalarPolynomialRegistrationValid{true};
+  bool batchJacobianRegistrationValid{true};
+  uint64_t batchAnalysisWork{1000000}, batchAnalysisStorage{16000000};
+  bool batchAnalysisLimitRead{false};
+  std::vector<double> batchDirection, batchValues, batchBaseline;
+  struct BatchPreparedGroup {
+    const void *identity;
+    std::vector<double> values;
+    std::vector<uint8_t> ready;
+  };
+  std::vector<BatchPreparedGroup> batchPreparedGroups;
+  bool batchPreparedScopeActive{false};
+  bool batchPreparedAcrossFamilies{false};
+  bool prepareBatchPrimalStorage();
+
   // The jacobian functions associated with the equations.
   // The i-th position contains the list of partial derivative functions of
   // the i-th equation. The j-th function represents the function to
@@ -805,22 +978,22 @@ private:
   realtype currentTime = 0;
 
   // Variables vectors and values.
-  N_Vector variablesVector;
-  N_Vector derivativesVector;
+  N_Vector variablesVector{nullptr};
+  N_Vector derivativesVector{nullptr};
 
   // The vector stores whether each scalar variable is an algebraic or a
   // state one.
   // 0 = algebraic
   // 1 = state
-  N_Vector idVector;
+  N_Vector idVector{nullptr};
 
   // The tolerance for each scalar variable.
-  N_Vector tolerancesVector;
+  N_Vector tolerancesVector{nullptr};
 
   // IDA classes.
-  void *idaMemory;
+  void *idaMemory{nullptr};
 
-  SUNMatrix sparseMatrix;
+  SUNMatrix sparseMatrix{nullptr};
 
   // Support structure for the computation of the jacobian matrix.
   // The outer vector has a number of elements equal to the scalar number
@@ -831,7 +1004,7 @@ private:
   // value of the partial derivative.
   std::vector<std::vector<std::pair<sunindextype, double>>> jacobianMatrixData;
 
-  SUNLinearSolver linearSolver;
+  SUNLinearSolver linearSolver{nullptr};
 
   std::vector<VariableGetter> algebraicAndStateVariablesGetters;
   std::vector<VariableSetter> algebraicAndStateVariablesSetters;
@@ -975,6 +1148,27 @@ RUNTIME_FUNC_DECL(idaAddEquation, uint64_t, PTR(void), PTR(int64_t), uint64_t,
                   PTR(void))
 
 RUNTIME_FUNC_DECL(idaSetResidual, void, PTR(void), uint64_t, PTR(void))
+
+RUNTIME_FUNC_DECL(idaSetBatchResidualV1, void, PTR(void), uint64_t, uint64_t,
+                  PTR(void))
+
+RUNTIME_FUNC_DECL(idaSetBatchJacobianV1, void, PTR(void), uint64_t, uint64_t,
+                  PTR(void), uint64_t, PTR(uint64_t))
+
+RUNTIME_FUNC_DECL(idaSetScalarPolynomialV1, void, PTR(void), uint64_t, uint64_t,
+                  uint64_t, PTR(uint64_t), uint64_t, PTR(uint64_t), PTR(uint64_t))
+
+RUNTIME_FUNC_DECL(idaSetScalarExplicitV1, void, PTR(void), uint64_t, uint64_t,
+                  PTR(void))
+
+RUNTIME_FUNC_DECL(idaSetBatchJacobianSupportV1, void, PTR(void), uint64_t, uint64_t,
+                  PTR(void), uint64_t)
+
+RUNTIME_FUNC_DECL(idaSetBatchTangentV2, void, PTR(void), uint64_t, uint64_t,
+                  PTR(void), uint64_t, PTR(uint64_t))
+
+RUNTIME_FUNC_DECL(idaSetBatchPreparedTangentV3, void, PTR(void), uint64_t,
+                  uint64_t, PTR(void), PTR(void), uint64_t)
 
 RUNTIME_FUNC_DECL(idaAddJacobian, void, PTR(void), uint64_t, uint64_t,
                   PTR(void), uint64_t, PTR(uint64_t))

@@ -12,6 +12,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -26,6 +28,21 @@ using namespace marco::runtime::sundials::kinsol;
 //===---------------------------------------------------------------------===//
 
 namespace marco::runtime::sundials::kinsol {
+template <typename Callback>
+static double invokeScalarBlockCallback(Callback &&callback) {
+#ifdef THREADS_ENABLE
+  // 中文：保持已有单 worker 直接执行方程体的异常边界。
+  // Match the existing one-worker direct equation body's exception boundary.
+  try {
+    return callback();
+  } catch (...) {
+    std::terminate();
+  }
+#else
+  return callback();
+#endif
+}
+
 static const char *getParallelIterationKindName(
     EquationsParallelIterationKind kind) {
   switch (kind) {
@@ -64,16 +81,232 @@ KINSOLInstance::KINSOLInstance() {
   }
 }
 
+struct KINSOLInstance::C2KernelState {
+  MarcoC2KernelV1 descriptor{};
+  std::vector<double> values, residuals, matrix;
+  std::vector<uint64_t> kinds, offsets{0}, rows, columns;
+  uint64_t solved{0}, declined{0}, healthAccepted{0}, healthDeclined{0};
+};
+
+// 中文：绑定实际 scalar F/J、getter/setter、配对和 V1 布局；同名函数或数值零都不能替代身份一致。
+// English: Bind actual scalar F/J, accessors, pairing and V1 layout; equal names or observed
+// zeros cannot replace identity checks.
+bool KINSOLInstance::bindC2KernelV1(const MarcoC2KernelV1 &d) {
+  auto invalid = [&](const char *reason, uint64_t row = 0,
+                     uint64_t column = 0) {
+    std::cerr << "[KINSOL] c2_kernel_v1_invalid_binding reason=" << reason
+              << " domain=" << d.domain << " epoch=" << d.epoch
+              << " component=" << d.component << " row=" << row
+              << " column=" << column << '\n';
+    return false;
+  };
+  if (initialized || c2Kernel || d.version != 1 ||
+      d.descriptorBytes != sizeof(MarcoC2KernelV1) || !d.rows || d.rows>16 ||
+      !d.residuals || !d.jacobians || !d.getters || !d.setters || !d.matchedColumns ||
+      !d.residual || !d.jacobian || !d.install || !d.read || !d.health || !d.solve ||
+      d.scratchBytes>65536)
+    return invalid("descriptor_or_lifecycle");
+  const auto n=d.rows;
+  if (variableGetters.size()!=n || variableSetters.size()!=n ||
+      equationRanges.size()!=n || timedResidualFunctions.size()!=n ||
+      timedResidualPostprocessor)
+    return invalid("shape_or_postprocessor");
+  for (uint64_t row=0; row<n; ++row) {
+    if (getVariableFlatSize(row)!=1 || getEquationFlatSize(row)!=1 ||
+        reinterpret_cast<const void *>(variableGetters[row])!=d.getters[row] ||
+        reinterpret_cast<const void *>(variableSetters[row])!=d.setters[row] ||
+        reinterpret_cast<const void *>(timedResidualFunctions[row])!=d.residuals[row])
+      return invalid("scalar_callback", row);
+    for (uint64_t column=0; column<n; ++column) {
+      const void *callback = row<timedJacobianFunctions.size() &&
+          column<timedJacobianFunctions[row].size()
+              ? reinterpret_cast<const void *>(timedJacobianFunctions[row][column].first)
+              : nullptr;
+      if (callback!=d.jacobians[row*n+column])
+        return invalid("jacobian_callback", row, column);
+    }
+  }
+  // 中文：缺少可选多项式/分区证明不是输入错误。
+  // Missing optional polynomial/partition proof is not an input error.
+  if (!scalarBlockPlan || !scalarBlockBudget) return true;
+  if (scalarBlockRows.size()!=n) return invalid("plan_size");
+  for (uint64_t row=0;row<n;++row)
+    if (scalarBlockRows[row].matchedColumn!=d.matchedColumns[row])
+      return invalid("selected_pairing", row);
+  // 中文：显式隔离可支持仿射算术以外的表达式；本后端只有在既有多项式证明其线性时才使用线性求解。
+  // Explicit isolation can support more than affine arithmetic. This backend
+  // only uses its linear solve when the existing polynomial proves that fact.
+  for (const auto &block:scalarBlockPlan->getExecutionBlocks()) {
+    if (block.kind!=ScalarBlockPlan::Kind::Explicit) continue;
+    uint64_t mask=0;
+    for(auto c:block.columns) mask|=uint64_t(1)<<c;
+    for(auto row:block.rows)
+      for(const auto &term:scalarBlockRows[row].terms)
+        if ((term.squared&mask) || __builtin_popcountll(term.linear&mask)>1)
+          return true;
+  }
+  uint64_t bytes=(n*n+10*n+4)*sizeof(uint64_t)+sizeof(C2KernelState);
+  if (scalarBlockBudget->work<n*n+4*n || scalarBlockBudget->storage<bytes)
+    return true;
+  scalarBlockBudget->work-=n*n+4*n;
+  scalarBlockBudget->storage-=bytes;
+  auto state=std::make_unique<C2KernelState>();
+  state->descriptor=d;
+  state->values.resize(n);state->residuals.resize(n);state->matrix.resize(n*n);
+  for(const auto &block:scalarBlockPlan->getExecutionBlocks()) {
+    state->kinds.push_back(static_cast<uint64_t>(block.kind));
+    state->rows.insert(state->rows.end(),block.rows.begin(),block.rows.end());
+    state->columns.insert(state->columns.end(),block.columns.begin(),block.columns.end());
+    state->offsets.push_back(state->rows.size());
+  }
+  c2Kernel=std::move(state);
+  solveEntry = &KINSOLInstance::solveBody<true>;
+  return true;
+}
+
+// 中文：生成健康计算只能在当前求值作用域内提供数值证据；无法认证时保留原完整检查。
+// English: Generated health evaluation supplies numerical evidence only in the current scope;
+// unavailable certification retains the original full check.
+bool KINSOLInstance::certifyC2KernelPoint(realtype time,
+    const std::vector<uint64_t> &rows, const std::vector<uint64_t> &columns,
+    SparseNonlinearSystem::ConditionEstimate &chart,
+    SparseNonlinearSystem::ConditionEstimate &closure) {
+  if (!c2Kernel || !initialized || !nonlinearSystem) return false;
+  auto &state=*c2Kernel;
+  currentTime=time;
+  state.descriptor.read(state.values.data());
+  const SuccessfulPoint *point=successfulPoint;
+  successfulPoint=nullptr;
+  // 中文：成功点残差只能在当前时间及局部值逐位一致时消费一次；Jacobian 始终在实际当前点重算，避免把旧 Newton 点当作健康证据。
+  // English: Consume a successful-point residual once only when time and local values match
+  //          bitwise. Always recompute the current-point Jacobian instead of treating an old Newton
+  //          iterate as health evidence.
+  bool same=point && std::memcmp(&point->time,&time,sizeof(realtype))==0 &&
+      point->variables.size()==state.values.size() &&
+      std::memcmp(point->variables.data(),state.values.data(),
+                  state.values.size()*sizeof(double))==0;
+  if (same) state.residuals=point->residuals;
+  else invokeScalarBlockCallback([&] {
+    state.descriptor.residual(time,~uint64_t(0),state.residuals.data());return 0.;
+  });
+  invokeScalarBlockCallback([&] {
+    state.descriptor.jacobian(time,~uint64_t(0),~uint64_t(0),state.matrix.data());return 0.;
+  });
+  if (marco::runtime::simulation::getOptions().profiling) {
+    auto &observation=nonlinearSystem->lastResidualObservation;
+    observation={true,true,0,0};
+    for(size_t row=0;row<state.residuals.size();++row) {
+      auto value=state.residuals[row];
+      observation.finite &= std::isfinite(value);
+      observation.maximumNorm=std::max(observation.maximumNorm,std::abs(value));
+      observation.scaledMaximumNorm=std::max(observation.scaledMaximumNorm,
+          std::abs(value)*nonlinearSystem->getResidualScale()[row]);
+    }
+  }
+  // 中文：先排除非有限 F/J，再用生成核的完整闭包健康界与独立 chart condition 共同认证；快速界未命中不等于奇异性证明。
+  // English: Reject non-finite F/J before combining the generated closure-health bound with an
+  //          independent chart-condition check. A missed fast bound is not a singularity
+  //          certificate.
+  for(double value:state.residuals) if(!std::isfinite(value)) return false;
+  for(double value:state.matrix) if(!std::isfinite(value)) return false;
+  double health[3]{};
+  if (state.descriptor.health(state.matrix.data(),
+      nonlinearSystem->getVariableScale().data(),
+      nonlinearSystem->getResidualScale().data(),health)!=1) {
+    ++state.healthDeclined;return false;
+  }
+  closure={};
+  closure.rank=state.values.size();
+  closure.oneNormCondition=health[0];closure.reciprocalCondition=1./health[0];
+  closure.minimumPivot=health[1];closure.maximumPivot=health[2];
+  if (!nonlinearSystem->estimateFlatCondition(state.matrix.data(),rows,columns,chart) ||
+      chart.rankDeficient || !std::isfinite(chart.oneNormCondition) ||
+      chart.oneNormCondition>=500) return false;
+  ++state.healthAccepted;
+  return true;
+}
+
+
 KINSOLInstance::~KINSOLInstance() {
+  if (c2Kernel && marco::runtime::simulation::getOptions().profiling)
+    std::cerr << "[c2-kernel-v1] rows=" << c2Kernel->descriptor.rows
+              << " solved=" << c2Kernel->solved << " declined=" << c2Kernel->declined
+              << " healthy=" << c2Kernel->healthAccepted
+              << " health_fallback=" << c2Kernel->healthDeclined << '\n';
+  if (marco::runtime::simulation::getOptions().profiling && scalarBlockPlan)
+    std::cerr << "[kinsol-scalar-blocks] solver_id=" << getStatisticsId()
+              << " blocks=" << scalarBlockPlan->getExecutionBlocks().size()
+              << " accepted=" << scalarBlockAccepted
+              << " original_solver=" << scalarBlockDeclined << '\n';
+  if (marco::runtime::simulation::getOptions().profiling)
+    std::cerr << "[kinsol-call-statistics] solver_id=" << getStatisticsId()
+              << " scope=lifetime_cumulative scalar_residual_calls="
+              << scalarResidualCalls.load() << " scalar_jacobian_calls="
+              << scalarJacobianCalls.load() << '\n';
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Instance destroyed" << std::endl;
   }
+}
+
+bool KINSOLInstance::requestImmutableAccessLayout(uint64_t workLimit,
+                                                 uint64_t storageLimit) {
+  if (initialized || workLimit > 1000000 || storageLimit > 16000000)
+    return false;
+  immutableAccessLayoutRequested = true;
+  layoutWorkLimit = workLimit;
+  layoutStorageLimit = storageLimit;
+  return true;
+}
+
+// 中文：注册几何改变时一并失效生成核、成功点回执、标量分块和访问布局，并恢复普通 solve 入口；不能保留旧绑定的部分优化状态。
+// English: Registration changes invalidate the generated kernel, successful-point receipt, scalar
+//          blocks, and access layout together, restoring ordinary solve dispatch. No partial
+//          optimization may retain stale bindings.
+void KINSOLInstance::invalidateAccessLayout() {
+  solveEntry = &KINSOLInstance::solveBody<false>;
+  c2Kernel.reset();
+  successfulPoint = nullptr;
+  scalarBlockSolver.reset();
+  scalarBlockPlan.reset();
+  scalarBlockRows.clear();
+  scalarExplicitValues.clear();
+  scalarBlockBudget = nullptr;
+  scalarBlockPrepared = false;
+  immutableAccessLayoutRequested = false;
+  accessLayout.reset();
+}
+
+bool KINSOLInstance::requestScalarBlockPlan(
+    std::vector<ScalarBlockPlan::Row> rows, ScalarBlockPlan::Budget &budget) {
+  return requestScalarBlockPlan(std::move(rows), {}, budget);
+}
+
+bool KINSOLInstance::requestScalarBlockPlan(
+    std::vector<ScalarBlockPlan::Row> rows,
+    std::vector<TimedResidualFunction> explicitValues,
+    ScalarBlockPlan::Budget &budget) {
+  if (initialized) return false;
+  if (!explicitValues.empty() && explicitValues.size() != rows.size())
+    return false;
+  for (size_t row = 0; row < rows.size(); ++row)
+    if (rows[row].explicitValueCertified !=
+        (!explicitValues.empty() && explicitValues[row] != nullptr))
+      return false;
+  auto [status, plan] = ScalarBlockPlan::build(rows, budget);
+  if (status == ScalarBlockPlan::Status::InvalidInput) return false;
+  if (status != ScalarBlockPlan::Status::Ready) return true;
+  scalarBlockRows = std::move(rows);
+  scalarExplicitValues = std::move(explicitValues);
+  scalarBlockPlan = std::move(plan);
+  scalarBlockBudget = &budget;
+  return true;
 }
 
 Variable KINSOLInstance::addVariable(uint64_t rank, const uint64_t *dimensions,
                                      VariableGetter getterFunction,
                                      VariableSetter setterFunction,
                                      const char *name) {
+  invalidateAccessLayout();
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Adding algebraic variable";
 
@@ -154,6 +387,7 @@ bool KINSOLInstance::setVariableNominalGetter(
 Equation KINSOLInstance::addEquation(const int64_t *ranges,
                                      uint64_t equationRank,
                                      const char *stringRepresentation) {
+  invalidateAccessLayout();
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Adding equation";
 
@@ -204,6 +438,7 @@ Equation KINSOLInstance::addEquation(const int64_t *ranges,
 
 void KINSOLInstance::addVariableAccess(Equation equation, Variable variable,
                                        AccessFunction accessFunction) {
+  invalidateAccessLayout();
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Adding access information" << std::endl;
     std::cerr << "  - Equation: " << equation << std::endl;
@@ -227,6 +462,7 @@ void KINSOLInstance::addVariableAccess(Equation equation, Variable variable,
 
 void KINSOLInstance::setResidualFunction(Equation equation,
                                          ResidualFunction residualFunction) {
+  invalidateAccessLayout();
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Setting residual function for equation " << equation
               << ". Address: " << reinterpret_cast<void *>(residualFunction)
@@ -242,6 +478,7 @@ void KINSOLInstance::setResidualFunction(Equation equation,
 
 void KINSOLInstance::setTimedResidualFunction(
     Equation equation, TimedResidualFunction residualFunction) {
+  invalidateAccessLayout();
   // 中文：timed 表与普通表按相同 equation ID 对齐；实际求值优先 timed callback，
   // 因而 component closure 可读取当前 IDA time 而不改变既有 ABI。
   // English: The timed table aligns with ordinary equation IDs. Evaluation
@@ -257,6 +494,7 @@ void KINSOLInstance::setTimedResidualPostprocessor(
     TimedResidualPostprocessor callback) {
   assert(!initialized && "KINSOL residual postprocessor must be set before "
                          "initialize");
+  invalidateAccessLayout();
   timedResidualPostprocessor = std::move(callback);
 }
 
@@ -264,6 +502,7 @@ void KINSOLInstance::addJacobianFunction(Equation equation, Variable variable,
                                          JacobianFunction jacobianFunction,
                                          uint64_t numOfSeeds,
                                          uint64_t *seedSizes) {
+  invalidateAccessLayout();
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[KINSOL] Setting jacobian function for equation " << equation
               << " and variable " << variable << "\n"
@@ -308,6 +547,7 @@ void KINSOLInstance::addTimedJacobianFunction(
     Equation equation, Variable variable,
     TimedJacobianFunction jacobianFunction, uint64_t numOfSeeds,
     uint64_t *seedSizes) {
+  invalidateAccessLayout();
   // 中文：seed shape 与 callback 一起保存，后续 chunk 构造按真实 callback 地址
   // 分配 AD buffer；timed-only 配置不依赖空的普通 callback。
   // English: Seed shapes are stored with the callback. Chunk construction
@@ -423,6 +663,34 @@ bool KINSOLInstance::initialize() {
 
   jacobianMatrixData.resize(scalarEquationsNumber);
 
+  // 中文：计划只拥有不可变几何及固定回调/seed 绑定，不保留数值。
+  //       完整构造后才发布；耗尽时丢弃计划，不改变矩阵或必需初始化工作。
+  // This plan owns immutable geometry and fixed callback/seed bindings, never
+  // numerical values. Publish only after complete construction; exhaustion
+  // drops it without changing the matrix or required initialization work.
+  std::unique_ptr<ImmutableAccessLayout> layout;
+  if (immutableAccessLayoutRequested && layoutWorkLimit != 0 &&
+      layoutStorageLimit >= sizeof(ImmutableAccessLayout)) {
+    layout = std::make_unique<ImmutableAccessLayout>();
+  }
+  uint64_t remainingWork = layoutWorkLimit;
+  uint64_t remainingStorage = layoutStorageLimit;
+  auto charge = [&](uint64_t count, uint64_t bytesPerItem) {
+    if (!layout)
+      return false;
+    if (count > remainingWork ||
+        (bytesPerItem != 0 && count > remainingStorage / bytesPerItem)) {
+      layout.reset();
+      return false;
+    }
+    remainingWork -= count;
+    remainingStorage -= count * bytesPerItem;
+    return true;
+  };
+  if (charge(1, sizeof(ImmutableAccessLayout)) &&
+      charge(scalarEquationsNumber, sizeof(std::vector<JacobianColumn>)))
+    layout->columns.resize(scalarEquationsNumber);
+
   uint64_t numOfVectorizedEquations = getNumOfVectorizedEquations();
 
   for (Equation eq = 0; eq < numOfVectorizedEquations; ++eq) {
@@ -455,6 +723,14 @@ bool KINSOLInstance::initialize() {
         std::cerr << "    Number of possibly non-zero columns: "
                   << jacobianColumns.size() << std::endl;
       }
+      if (charge(jacobianColumns.capacity(), sizeof(JacobianColumn))) {
+        for (const auto &column : jacobianColumns) {
+          if (!charge(column.second.capacity(), sizeof(uint64_t)))
+            break;
+        }
+        if (layout)
+          layout->columns[scalarEquationIndex] = std::move(jacobianColumns);
+      }
     } while (advanceEquationIndices(equationIndices, equationRanges[eq]));
   }
 
@@ -463,6 +739,115 @@ bool KINSOLInstance::initialize() {
 
   // Compute the equation chunks for each thread.
   computeThreadChunks();
+
+  if (charge(scalarVariablesNumber,
+             sizeof(ImmutableAccessLayout::VariableEntry))) {
+    layout->variables.reserve(scalarVariablesNumber);
+    for (Variable variable = 0; layout && variable < getNumOfArrayVariables();
+         ++variable) {
+      std::vector<uint64_t> indices;
+      getVariableBeginIndices(variable, indices);
+      if (getVariableFlatSize(variable) == 0)
+        continue;
+      do {
+        if (!charge(indices.size(), sizeof(uint64_t)))
+          break;
+        uint64_t offset = variableOffsets[variable] +
+                          getVariableFlatIndex(variablesDimensions[variable],
+                                               indices.data());
+        layout->variables.push_back({variable, indices, offset});
+      } while (advanceVariableIndices(indices, variablesDimensions[variable]));
+    }
+  }
+  if (charge(scalarEquationsNumber, sizeof(ImmutableAccessLayout::RowEntry))) {
+    layout->rows.reserve(scalarEquationsNumber);
+    for (size_t chunk = 0; layout && chunk < threadEquationsChunks.size();
+         ++chunk) {
+      const auto &descriptor = threadEquationsChunks[chunk];
+      auto indices = std::get<1>(descriptor);
+      do {
+        if (!charge(indices.size(), sizeof(int64_t)))
+          break;
+        auto equation = std::get<0>(descriptor);
+        auto offset = equationOffsets[equation] +
+                      getEquationFlatIndex(indices, equationRanges[equation]);
+        layout->rows.push_back({chunk, indices, offset});
+      } while (advanceEquationIndicesUntil(
+          indices, equationRanges[std::get<0>(descriptor)],
+          std::get<2>(descriptor)));
+    }
+  }
+  if (layout && (layout->variables.size() != scalarVariablesNumber ||
+                 layout->rows.size() != scalarEquationsNumber))
+    layout.reset();
+  if (layout && threadPool.getNumOfThreads() == 1 &&
+      charge(scalarEquationsNumber,
+             sizeof(std::vector<ImmutableAccessLayout::JacobianEntry>))) {
+    layout->evaluations.resize(scalarEquationsNumber);
+    for (size_t row = 0; layout && row < layout->rows.size(); ++row) {
+      const auto &entry = layout->rows[row];
+      const auto &chunk = threadEquationsChunks[entry.chunk];
+      Equation equation = std::get<0>(chunk);
+      const auto &seedsMap = std::get<3>(chunk);
+      const auto &columns = layout->columns[entry.offset];
+      if (!charge(columns.size(), sizeof(ImmutableAccessLayout::JacobianEntry)))
+        break;
+      auto &evaluations = layout->evaluations[entry.offset];
+      evaluations.reserve(columns.size());
+      for (const auto &column : columns) {
+        Variable variable = column.first;
+        if (!charge(column.second.size() + seedsMap.size() + 1, 0))
+          break;
+        auto callback = equation < jacobianFunctions.size() &&
+                                variable < jacobianFunctions[equation].size()
+                            ? jacobianFunctions[equation][variable].first
+                            : nullptr;
+        auto timed = equation < timedJacobianFunctions.size() &&
+                             variable < timedJacobianFunctions[equation].size()
+                         ? timedJacobianFunctions[equation][variable].first
+                         : nullptr;
+        // 中文：与普通路径使用相同 seed 键及 timed-callback 优先级；缓冲直到 chunk 销毁均稳定，新注册在修改描述符前使绑定失效。
+        // Use the same seed key and timed-callback precedence as the ordinary
+        // path. These buffers are stable until chunk destruction; registration
+        // invalidates the binding before changing any descriptor.
+        uintptr_t key = callback ? reinterpret_cast<uintptr_t>(callback)
+                                 : reinterpret_cast<uintptr_t>(timed);
+        auto seeds = seedsMap.find(key);
+        auto offset = variableOffsets[variable] +
+                      getVariableFlatIndex(variablesDimensions[variable],
+                                           column.second);
+        evaluations.push_back({static_cast<sunindextype>(offset), callback,
+                               timed, seeds == seedsMap.end()
+                                          ? nullptr : seeds->second.data()});
+      }
+    }
+  }
+  accessLayout = std::move(layout);
+
+  if (scalarBlockPlan) {
+    if (scalarBlockRows.size() != scalarEquationsNumber ||
+        scalarVariablesNumber != variablesDimensions.size() ||
+        scalarEquationsNumber != equationRanges.size()) return false;
+    if (!accessLayout || accessLayout->evaluations.empty() ||
+        timedResidualPostprocessor) {
+      // 中文：生成核派生于当前精确执行计划；多 worker 或不支持布局必须让计划和生成核同时失效。
+      // Generated kernels are derived from this exact execution plan. A
+      // multi-worker or unsupported layout must invalidate both together.
+      c2Kernel.reset();
+      solveEntry = &KINSOLInstance::solveBody<false>;
+      scalarBlockPlan.reset();
+      scalarBlockRows.clear();
+    } else {
+      for (size_t row = 0; row < scalarBlockRows.size(); ++row) {
+        uint64_t reads = 0;
+        for (const auto &entry : accessLayout->evaluations[row]) {
+          if (entry.column < 0 || entry.column >= 64) return false;
+          reads |= uint64_t(1) << entry.column;
+        }
+        if (reads != scalarBlockRows[row].reads) return false;
+      }
+    }
+  }
 
   realtype effectiveMaximumNewtonStep =
       maximumNewtonStep.value_or(getOptions().maxNewtonStep);
@@ -506,14 +891,58 @@ bool KINSOLInstance::initialize() {
 }
 
 bool KINSOLInstance::solve() {
-  return solveWithStatus(currentTime) == SolveStatus::Success;
+  return solve(currentTime);
 }
 
 KINSOLInstance::SolveStatus KINSOLInstance::solveWithStatus(realtype time) {
-  // 中文：facade 负责 MARCO 数组与 solver vector 的双向同步；失败时绝不把
-  // 未收敛的 trial values 写回模型数组。
-  // English: The facade synchronizes MARCO arrays with the solver vector and
-  // never writes unconverged trial values back to model storage on failure.
+  return solveImpl(time, false);
+}
+
+KINSOLInstance::SolveStatus KINSOLInstance::solveAndCheck(
+    realtype time, const std::function<void()> &inspection) {
+  auto status = solveImpl(time, false);
+  if (status != SolveStatus::Success)
+    return status;
+  if (!lastSolveWasBlocked || !scalarBlockSolver ||
+      timedResidualPostprocessor) {
+    inspection();
+    return status;
+  }
+  // 中文：完整最终 F 在所有块及根分支检查后、完整已安装解处求值，不能使用 Newton 前一迭代的残差。
+  //       owner 检查期间时间、参数、外层输入和 epoch 不变，且唯一允许消费前还逐位核对局部坐标。
+  // The complete final F was evaluated after every block and root-branch
+  // check, at the full installed solution, not at Newton's previous iterate.
+  // Time, parameters, outer inputs and the active epoch are unchanged within
+  // this owner-only inspection. Local coordinates are also checked bitwise
+  // immediately before the single allowed consumption.
+  SuccessfulPoint point{time, scalarBlockValues,
+                        scalarBlockSolver->finalResidual};
+  successfulPoint = &point;
+  struct Release {
+    KINSOLInstance &instance;
+    ~Release() { instance.successfulPoint = nullptr; }
+  } release{*this};
+  inspection();
+  return status;
+}
+
+KINSOLInstance::SolveStatus KINSOLInstance::solveImpl(realtype time,
+                                                     bool rollbackOnFailure) {
+  if (!initialized && !initialize())
+    return SolveStatus::FatalFailure;
+  return (this->*solveEntry)(time, rollbackOnFailure);
+}
+
+template <bool Generated>
+// 中文：generated 与基础后端在初始化时选定；数值 miss 还原 warm start，失败 trial 的健康检查仍由 IDA 事务负责。
+// English: Initialization selects generated or base execution; numerical misses restore the
+// warm start, while IDA owns failed-trial health checks.
+KINSOLInstance::SolveStatus KINSOLInstance::solveBody(realtype time,
+                                                    bool rollbackOnFailure) {
+  successfulPoint = nullptr;
+  // 中文：IDA 在外层事务恢复局部状态前检查失败 trial；只有独立调用在这个边界自行回滚。
+  // IDA inspects the failed trial before its enclosing transaction restores
+  // local state. Only standalone calls own the rollback at this boundary.
   currentTime = time;
   if (!initialized) {
     if (!initialize()) {
@@ -531,9 +960,64 @@ KINSOLInstance::SolveStatus KINSOLInstance::solveWithStatus(realtype time) {
 
   N_Vector variables = nonlinearSystem->getVariablesVector();
   copyVariablesFromMARCO(variables);
+  lastSolveWasBlocked = false;
+  scalarBlockIterations = 0;
+  if (scalarBlockPlan && prepareScalarBlockSolver()) {
+    scalarBlockSolver->setLineSearchEnabled(lineSearchEnabled);
+    const double *input = N_VGetArrayPointer(variables);
+    scalarBlockValues.assign(input, input + scalarVariablesNumber);
+    auto result = ScalarBlockSolver::Result::RetainOriginal;
+    bool generated = false;
+    if constexpr (Generated) {
+      generated = c2Kernel->descriptor.solve(time,
+        scalarBlockValues.data(), nonlinearSystem->getVariableScale().data(),
+        nonlinearSystem->getResidualScale().data(),
+        functionNormTolerance.value_or(getOptions().fnormtol),
+        c2Kernel->kinds.size(), c2Kernel->kinds.data(), c2Kernel->offsets.data(),
+        c2Kernel->rows.data(), c2Kernel->columns.data(),
+        c2Kernel->residuals.data(), &scalarBlockIterations) == 1;
+    }
+    if (generated) {
+      ++c2Kernel->solved;
+      scalarBlockSolver->finalResidual = c2Kernel->residuals;
+      result = ScalarBlockSolver::Result::Solved;
+    } else {
+      if constexpr (Generated) ++c2Kernel->declined;
+      scalarBlockValues.assign(input, input + scalarVariablesNumber);
+      result = scalarBlockSolver->solve(time, scalarBlockValues);
+      scalarBlockIterations = scalarBlockSolver->getLastNonlinearIterations();
+    }
+    std::copy(scalarBlockValues.begin(), scalarBlockValues.end(),
+              N_VGetArrayPointer(variables));
+    // 中文：分支或舍入证明不成立时，从原 warm start 进入完全相同的原求解；纯回调不能产生其它输出。
+    // A declined branch/roundoff proof re-enters exactly the original solve
+    // from the original warm start. Pure callbacks cannot have other outputs.
+    copyVariablesIntoMARCO(variables);
+    if (result == ScalarBlockSolver::Result::Solved) {
+      ++scalarBlockAccepted;
+      lastSolveWasBlocked = true;
+      return SolveStatus::Success;
+    }
+    ++scalarBlockDeclined;
+  }
+  std::vector<realtype> initialValues;
+  if (rollbackOnFailure) {
+    const realtype *initialData = N_VGetArrayPointer(variables);
+    initialValues.assign(initialData, initialData + scalarVariablesNumber);
+  }
   nonlinearSystem->setLineSearchEnabled(lineSearchEnabled);
   SparseNonlinearSystem::SolveStatus status = nonlinearSystem->solve(time);
   if (status != SparseNonlinearSystem::SolveStatus::Success) {
+    // 中文：residual/Jacobian 回调会通过普通模型 setter 安装 trial；仅省去成功后的最终复制并不会撤销这些写入。
+    //       失败时必须精确恢复注册未知量。
+    // Residual/Jacobian callbacks install trial values through the ordinary
+    // model setters. Skipping the final success copy alone does not roll
+    // those writes back. Restore exactly the registered unknowns on failure.
+    if (rollbackOnFailure) {
+      std::copy(initialValues.begin(), initialValues.end(),
+                N_VGetArrayPointer(variables));
+      copyVariablesIntoMARCO(variables);
+    }
     return status == SparseNonlinearSystem::SolveStatus::RecoverableFailure
                ? SolveStatus::RecoverableFailure
                : SolveStatus::FatalFailure;
@@ -543,12 +1027,12 @@ KINSOLInstance::SolveStatus KINSOLInstance::solveWithStatus(realtype time) {
 }
 
 bool KINSOLInstance::solve(realtype time) {
-  return solveWithStatus(time) == SolveStatus::Success;
+  return solveImpl(time, true) == SolveStatus::Success;
 }
 
 bool KINSOLInstance::solve(realtype time, bool enableLineSearch) {
   lineSearchEnabled = enableLineSearch;
-  return solveWithStatus(time) == SolveStatus::Success;
+  return solve(time);
 }
 
 void KINSOLInstance::setFunctionNormTolerance(realtype tolerance) {
@@ -634,20 +1118,36 @@ bool KINSOLInstance::configureInitializationAnchorScaling(realtype time) {
 }
 
 bool KINSOLInstance::factorizeCurrentJacobian(realtype time) {
-  // 中文：Schur/condition 查询总是在当前 MARCO 数组值上刷新一次 Jacobian，
-  // 随后的多个 RHS 共享该分解直到下一次显式 factorize。
-  // English: Schur and condition queries refresh the Jacobian from current
-  // MARCO arrays once; subsequent right-hand sides share that factorization
-  // until the next explicit factorize call.
+  return factorizeCurrentJacobianWithStatus(time) ==
+         SparseNonlinearSystem::FactorizationStatus::Success;
+}
+
+SparseNonlinearSystem::FactorizationStatus
+KINSOLInstance::factorizeCurrentJacobianWithStatus(realtype time) {
+  // 中文：始终刷新当前点的 Jacobian 与分解；只有紧接着成功点检查中的完整 F 可代替重复残差求值，不能复用 Newton Jacobian。
+  //       后续多右端项仍共享这一次新分解。
+  // Always refresh the current-point Jacobian and factorization. Only the
+  // complete F from the immediately enclosing successful-point inspection
+  // can replace a duplicate F evaluation; a Newton Jacobian is never reused.
+  // Subsequent RHS solves share this fresh factorization as before.
   currentTime = time;
   if (!initialized && !initialize()) {
-    return false;
+    return SparseNonlinearSystem::FactorizationStatus::SolverFailure;
   }
   if (getNumOfScalarEquations() == 0) {
-    return true;
+    return SparseNonlinearSystem::FactorizationStatus::Success;
   }
   copyVariablesFromMARCO(nonlinearSystem->getVariablesVector());
-  return nonlinearSystem->factorize(time);
+  const SuccessfulPoint *point = successfulPoint;
+  // 中文：一份回执只允许一次检查。
+  successfulPoint = nullptr; // A receipt can authorize exactly one check.
+  if (point && std::memcmp(&point->time, &time, sizeof(realtype)) == 0 &&
+      point->variables.size() == scalarVariablesNumber &&
+      std::memcmp(point->variables.data(),
+                  N_VGetArrayPointer(nonlinearSystem->getVariablesVector()),
+                  scalarVariablesNumber * sizeof(realtype)) == 0)
+    return nonlinearSystem->factorizeWithResidual(time, point->residuals);
+  return nonlinearSystem->factorizeWithStatus(time);
 }
 
 bool KINSOLInstance::solveCurrentJacobian(
@@ -680,9 +1180,105 @@ double KINSOLInstance::getScalarVariableNominal(uint64_t scalarIndex) const {
 }
 
 uint64_t KINSOLInstance::getLastNonlinearIterations() const {
-  return nonlinearSystem == nullptr
-             ? 0
-             : nonlinearSystem->getLastNonlinearIterations();
+  return scalarBlockIterations +
+         (lastSolveWasBlocked || nonlinearSystem == nullptr
+              ? 0 : nonlinearSystem->getLastNonlinearIterations());
+}
+
+bool KINSOLInstance::prepareScalarBlockSolver() {
+  if (scalarBlockPrepared) return scalarBlockSolver != nullptr;
+  scalarBlockPrepared = true;
+  if (!scalarBlockPlan || !scalarBlockBudget || !accessLayout ||
+      accessLayout->evaluations.empty() || timedResidualPostprocessor)
+    return false;
+  auto install = [this](const std::vector<double> &values) {
+    std::copy(values.begin(), values.end(),
+              N_VGetArrayPointer(nonlinearSystem->getVariablesVector()));
+    copyVariablesIntoMARCO(nonlinearSystem->getVariablesVector());
+  };
+  auto rowEntry = [this](uint32_t row) -> const ImmutableAccessLayout::RowEntry & {
+    // 中文：布局行保持 chunk 顺序；即使不同于注册顺序，原标量 offset 仍是权威。
+    // The layout's rows retain chunk order; original scalar offsets remain
+    // authoritative even if that order differs from registration order.
+    auto it = std::find_if(accessLayout->rows.begin(), accessLayout->rows.end(),
+                          [&](const auto &entry) { return entry.offset == row; });
+    assert(it != accessLayout->rows.end());
+    return *it;
+  };
+  SparseNonlinearSystem::Configuration configuration{
+      scalarVariablesNumber, nonZeroValuesNumber,
+      functionNormTolerance.value_or(getOptions().fnormtol),
+      scaledStepTolerance.value_or(getOptions().scsteptol),
+      maximumNewtonStep.value_or(getOptions().maxNewtonStep),
+      lineSearchEnabled, quietErrors};
+  if (configuration.maximumNewtonStep <= 0)
+    configuration.maximumNewtonStep = std::max<realtype>(
+        100, 10 * std::sqrt(static_cast<realtype>(scalarVariablesNumber)));
+  scalarBlockSolver = ScalarBlockSolver::create(
+      *scalarBlockPlan, configuration,
+      [this, rowEntry](uint32_t row, const std::vector<double> &) {
+        const auto &entry = rowEntry(row);
+        Equation equation = std::get<0>(threadEquationsChunks[entry.chunk]);
+        if (marco::runtime::simulation::getOptions().profiling)
+          ++scalarResidualCalls;
+        auto timed = equation < timedResidualFunctions.size()
+                         ? timedResidualFunctions[equation] : nullptr;
+        return invokeScalarBlockCallback([&] {
+          return timed ? timed(currentTime, entry.indices.data())
+                       : residualFunctions[equation](entry.indices.data());
+        });
+      },
+      [this, rowEntry](uint32_t row, uint32_t column,
+                       const std::vector<double> &) {
+        const auto &entry = rowEntry(row);
+        const auto &evaluations = accessLayout->evaluations[row];
+        for (size_t i = 0; i < evaluations.size(); ++i) {
+          const auto &binding = evaluations[i];
+          if (binding.column != column) continue;
+          if (marco::runtime::simulation::getOptions().profiling)
+            ++scalarJacobianCalls;
+          const auto &indices = accessLayout->columns[row][i].second;
+          return invokeScalarBlockCallback([&] {
+            return binding.timedCallback
+                ? binding.timedCallback(currentTime, entry.indices.data(),
+                      indices.data(), 0.0, memoryPoolId, binding.seeds)
+                : binding.callback(entry.indices.data(), indices.data(),
+                                    memoryPoolId, binding.seeds);
+          });
+        }
+        // 中文：该位置不属于完整认证访问关系。
+        return 0.0; // Absent from the complete certified access relation.
+      }, *scalarBlockBudget, install);
+  if (scalarBlockSolver && !scalarExplicitValues.empty())
+    scalarBlockSolver->setExplicitValues(
+        [this, rowEntry](uint32_t row, const std::vector<double> &) {
+          return invokeScalarBlockCallback([&] {
+            return scalarExplicitValues[row](currentTime,
+                                              rowEntry(row).indices.data());
+          });
+        });
+  if (scalarBlockSolver && !scalarBlockSolver->setScaling(
+          nonlinearSystem->getVariableScale(), nonlinearSystem->getResidualScale()))
+    scalarBlockSolver.reset();
+  return scalarBlockSolver != nullptr;
+}
+
+void KINSOLInstance::printInitializationScaling() const {
+  if (!nonlinearSystem)
+    return;
+  const auto &variables = nonlinearSystem->getVariableScale();
+  const auto &residuals = nonlinearSystem->getResidualScale();
+  size_t count = std::min<size_t>(256, variables.size());
+  std::cerr << std::setprecision(17)
+            << "[sparse-solver-scaling] id=" << getStatisticsId()
+            << " entries=" << variables.size() << " printed=" << count
+            << " variable_scale=";
+  for (size_t i = 0; i < count; ++i)
+    std::cerr << (i ? "," : "") << variables[i];
+  std::cerr << " residual_scale=";
+  for (size_t i = 0; i < count; ++i)
+    std::cerr << (i ? "," : "") << residuals[i];
+  std::cerr << '\n';
 }
 
 int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
@@ -704,15 +1300,8 @@ int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
   instance->equationsParallelIteration(
       EquationsParallelIterationKind::Residuals,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
-          const JacobianSeedsMap &jacobianSeedsMap) {
+          const JacobianSeedsMap &jacobianSeedsMap, uint64_t offset) {
         assert(equationIndices.size() == instance->getEquationRank(eq));
-
-        uint64_t equationArrayOffset = instance->equationOffsets[eq];
-
-        uint64_t equationScalarOffset =
-            getEquationFlatIndex(equationIndices, instance->equationRanges[eq]);
-
-        uint64_t offset = equationArrayOffset + equationScalarOffset;
 
         // 中文：timed callback 专供 IDA component closure；普通 KINSOL 路径仍
         // 使用无时间签名，两者共享相同 residual buffer 和有限值检查。
@@ -727,6 +1316,8 @@ int KINSOLInstance::residualFunction(N_Vector variables, N_Vector residuals,
                                    : nullptr;
         auto *eqIndicesPtr = equationIndices.data();
 
+        if (marco::runtime::simulation::getOptions().profiling)
+          ++instance->scalarResidualCalls;
         auto residualFunctionResult =
             timedResidualFn != nullptr
                 ? timedResidualFn(instance->currentTime, eqIndicesPtr)
@@ -776,20 +1367,43 @@ int KINSOLInstance::jacobianMatrix(N_Vector variables, N_Vector residuals,
   instance->equationsParallelIteration(
       EquationsParallelIterationKind::Jacobian,
       [&](Equation eq, const std::vector<int64_t> &equationIndices,
-          const JacobianSeedsMap &jacobianSeedsMap) {
-        uint64_t equationArrayOffset = instance->equationOffsets[eq];
-
-        uint64_t equationScalarOffset =
-            getEquationFlatIndex(equationIndices, instance->equationRanges[eq]);
-
-        uint64_t scalarEquationIndex =
-            equationArrayOffset + equationScalarOffset;
-
+          const JacobianSeedsMap &jacobianSeedsMap,
+          uint64_t scalarEquationIndex) {
         assert(scalarEquationIndex < instance->getNumOfScalarEquations());
 
+        if (instance->accessLayout &&
+            !instance->accessLayout->evaluations.empty()) {
+          const auto &bindings =
+              instance->accessLayout->evaluations[scalarEquationIndex];
+          const auto &columns =
+              instance->accessLayout->columns[scalarEquationIndex];
+          for (size_t i = 0; i < bindings.size(); ++i) {
+            const auto &binding = bindings[i];
+            assert((binding.callback || binding.timedCallback) &&
+                   "Missing Jacobian callback");
+            if (marco::runtime::simulation::getOptions().profiling)
+              ++instance->scalarJacobianCalls;
+            double value = binding.timedCallback
+                ? binding.timedCallback(instance->currentTime,
+                       equationIndices.data(), columns[i].second.data(), 0.0,
+                       instance->memoryPoolId, binding.seeds)
+                : binding.callback(equationIndices.data(),
+                       columns[i].second.data(), instance->memoryPoolId,
+                       binding.seeds);
+            instance->jacobianMatrixData[scalarEquationIndex][i] =
+                {binding.column, value};
+          }
+          return;
+        }
+
         // Compute the column indexes that may be non-zeros.
-        std::vector<JacobianColumn> jacobianColumns =
-            instance->computeJacobianColumns(eq, equationIndices.data());
+        std::vector<JacobianColumn> transientColumns;
+        if (!instance->accessLayout)
+          transientColumns =
+              instance->computeJacobianColumns(eq, equationIndices.data());
+        const auto &jacobianColumns = instance->accessLayout
+            ? instance->accessLayout->columns[scalarEquationIndex]
+            : transientColumns;
 
         // For every scalar variable with respect to which the equation must be
         // partially differentiated.
@@ -833,6 +1447,8 @@ int KINSOLInstance::jacobianMatrix(N_Vector variables, N_Vector residuals,
             seedsPtr = seedsMapIt->second.data();
           }
 
+          if (marco::runtime::simulation::getOptions().profiling)
+            ++instance->scalarJacobianCalls;
           auto jacobianFunctionResult = timedJacobianFunction != nullptr
               ? timedJacobianFunction(
                     instance->currentTime, equationIndices.data(),
@@ -978,15 +1594,22 @@ KINSOLInstance::computeJacobianColumns(Equation eq,
       variableIndices.resize(variableRank, 0);
       accessFunction(equationIndices, variableIndices.data());
 
-      assert([&]() -> bool {
-        for (uint64_t i = 0; i < variableRank; ++i) {
-          if (variableIndices[i] >= variablesDimensions[variable][i]) {
-            return false;
-          }
+      bool outsideBlock = false;
+      for (uint64_t i = 0; i < variableRank; ++i) {
+        if (variableIndices[i] >= variablesDimensions[variable][i]) {
+          outsideBlock = true;
+          break;
         }
-
-        return true;
-      }() && "Access out of bounds");
+      }
+      // 中文：IDA 将原仿射访问平移到各注册变量块，其像只在部分行与当前块相交。
+      //       局部 KINSOL 复用映射时必须保留该范围限制；块外像不能算作当前块的列。
+      // IDA passes the original affine access translated into each registered
+      // variable block. Its image intersects this block only on some rows.
+      // Preserve IDA's range restriction when reusing the map in a local
+      // KINSOL closure; an outside image is not a column of this block.
+      if (outsideBlock) {
+        continue;
+      }
 
       uniqueColumns.insert({variable, variableIndices});
     }
@@ -1009,30 +1632,11 @@ KINSOLInstance::computeJacobianColumns(Equation eq,
     }
   }
 
-  std::vector<JacobianColumn> orderedColumns;
-
-  for (const JacobianColumn &column : uniqueColumns) {
-    orderedColumns.push_back(column);
-  }
-
-  std::sort(orderedColumns.begin(), orderedColumns.end(),
-            [](const JacobianColumn &first, const JacobianColumn &second) {
-              if (first.first != second.first) {
-                return first.first < second.first;
-              }
-
-              assert(first.second.size() == second.second.size());
-
-              for (size_t i = 0, e = first.second.size(); i < e; ++i) {
-                if (first.second[i] < second.second[i]) {
-                  return true;
-                }
-              }
-
-              return false;
-            });
-
-  return orderedColumns;
+  // 中文：set 已按变量和索引元组字典序排序；逐轴“任一轴更小”不是严格弱序，两方向可能同时比较为真。
+  // The set already orders (variable, index tuple) lexicographically.
+  // Re-sorting with a per-axis "any less" comparison is not a strict weak
+  // order: both (0,1)<(1,0) and its reverse would compare true.
+  return {uniqueColumns.begin(), uniqueColumns.end()};
 }
 
 /// Compute the number of non-zero values in the Jacobian Matrix. Also
@@ -1158,6 +1762,12 @@ void KINSOLInstance::copyVariablesFromMARCO(N_Vector variables) {
   KINSOL_PROFILER_COPY_VARS_FROM_MARCO_START
 
   realtype *varsPtr = N_VGetArrayPointer(variables);
+  if (accessLayout && !marco::runtime::simulation::getOptions().debug) {
+    for (const auto &entry : accessLayout->variables)
+      varsPtr[entry.offset] = variableGetters[entry.variable](entry.indices.data());
+    KINSOL_PROFILER_COPY_VARS_FROM_MARCO_STOP
+    return;
+  }
   uint64_t numOfArrayVariables = getNumOfArrayVariables();
 
   for (Variable var = 0; var < numOfArrayVariables; ++var) {
@@ -1198,6 +1808,16 @@ void KINSOLInstance::copyVariablesIntoMARCO(N_Vector variables) {
   KINSOL_PROFILER_COPY_VARS_INTO_MARCO_START
 
   realtype *varsPtr = N_VGetArrayPointer(variables);
+  if (accessLayout && !marco::runtime::simulation::getOptions().debug) {
+    for (const auto &entry : accessLayout->variables) {
+      double value = varsPtr[entry.offset];
+      variableSetters[entry.variable](value, entry.indices.data());
+      assert(variableGetters[entry.variable](entry.indices.data()) == value &&
+             "Variable value not set correctly");
+    }
+    KINSOL_PROFILER_COPY_VARS_INTO_MARCO_STOP
+    return;
+  }
   uint64_t numOfArrayVariables = getNumOfArrayVariables();
 
   for (Variable var = 0; var < numOfArrayVariables; ++var) {
@@ -1239,7 +1859,8 @@ void KINSOLInstance::equationsParallelIteration(
     EquationsParallelIterationKind kind,
     std::function<void(Equation equation,
                        const std::vector<int64_t> &equationIndices,
-                       const JacobianSeedsMap &jacobianSeedsMap)>
+                       const JacobianSeedsMap &jacobianSeedsMap,
+                       uint64_t scalarEquationIndex)>
         processFn) {
   // Shard the work among multiple threads.
   unsigned int numOfThreads = threadPool.getNumOfThreads();
@@ -1247,13 +1868,27 @@ void KINSOLInstance::equationsParallelIteration(
   const auto &simulationOptions = marco::runtime::simulation::getOptions();
   bool collectStats = simulationOptions.debug || simulationOptions.profiling;
   std::vector<::marco::runtime::profiling::ParallelThreadWorkStats> threadWork(
-      numOfThreads);
-  std::vector<std::thread::id> threadIds(numOfThreads);
+      collectStats ? numOfThreads : 0);
+  std::vector<std::thread::id> threadIds(collectStats ? numOfThreads : 0);
 
-  for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
-    threadPool.async([&, thread]() {
+  auto job = [&](unsigned int thread) {
       if (collectStats) {
         threadIds[thread] = std::this_thread::get_id();
+      }
+
+      if (numOfThreads == 1 && accessLayout) {
+        size_t lastChunk = threadEquationsChunks.size();
+        for (const auto &row : accessLayout->rows) {
+          const auto &chunk = threadEquationsChunks[row.chunk];
+          if (collectStats) {
+            if (row.chunk != lastChunk)
+              ++threadWork[thread].chunks;
+            ++threadWork[thread].scalarEquations;
+          }
+          lastChunk = row.chunk;
+          processFn(std::get<0>(chunk), row.indices, std::get<3>(chunk), row.offset);
+        }
+        return;
       }
 
       size_t assignedChunk;
@@ -1285,7 +1920,9 @@ void KINSOLInstance::equationsParallelIteration(
             return true;
           }() && "Invalid equation indices");
 
-          processFn(equation, equationIndices, std::get<3>(chunk));
+          processFn(equation, equationIndices, std::get<3>(chunk),
+                    equationOffsets[equation] + getEquationFlatIndex(
+                        equationIndices, equationRanges[equation]));
 
           if (collectStats) {
             ++threadWork[thread].scalarEquations;
@@ -1293,10 +1930,31 @@ void KINSOLInstance::equationsParallelIteration(
         } while (advanceEquationIndicesUntil(
             equationIndices, equationRanges[equation], std::get<2>(chunk)));
       }
-    });
-  }
+  };
 
-  threadPool.wait();
+  if (numOfThreads == 1) {
+    // 中文：单 worker 使用调用线程及其 TLS，保持相同 chunk 和 seed，只省去逐回调队列交接。
+    // A single worker uses the caller's thread (and TLS). Keep exactly the
+    // same chunks and seeds, without a queue hand-off for each callback.
+#ifdef THREADS_ENABLE
+    try {
+      job(0);
+    } catch (...) {
+      // 中文：原 worker 线程的未捕获异常也会终止，保持原语义。
+      // An uncaught exception on the former worker thread terminated too.
+      std::terminate();
+    }
+#else
+    // 中文：未启用线程时 ThreadPool::async 传播异常。
+    // ThreadPool::async propagates exceptions in non-threaded builds.
+    job(0);
+#endif
+  } else {
+    for (unsigned int thread = 0; thread < numOfThreads; ++thread) {
+      threadPool.async([&, thread]() { job(thread); });
+    }
+    threadPool.wait();
+  }
 
   if (simulationOptions.debug) {
     printParallelIterationStats(kind, threadWork, threadIds);

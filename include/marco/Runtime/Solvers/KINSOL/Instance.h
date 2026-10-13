@@ -5,18 +5,25 @@
 
 #include "kinsol/kinsol.h"
 #include "marco/Runtime/Solvers/KINSOL/SparseNonlinearSystem.h"
+#include "marco/Runtime/Solvers/KINSOL/ScalarBlockSolver.h"
+#include "marco/Runtime/Solvers/IDA/C2KernelV1.h"
 #include "marco/Runtime/Solvers/SUNDIALS/Instance.h"
 #include "nvector/nvector_serial.h"
 #include "sundials/sundials_config.h"
 #include "sundials/sundials_types.h"
 #include "sunlinsol/sunlinsol_klu.h"
 #include "sunmatrix/sunmatrix_sparse.h"
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <vector>
+
+namespace marco::runtime::sundials::ida {
+class IDAInstance;
+}
 
 namespace marco::runtime::sundials::kinsol {
 
@@ -70,6 +77,11 @@ using ThreadEquationsChunk = std::tuple<Equation, std::vector<int64_t>,
 
 enum class EquationsParallelIterationKind { Residuals, Jacobian };
 
+/// 中文：有效 worker 为一时，方程回调在调用线程执行并读取其 TLS；多 worker 继续在线程池执行。
+///       这不会使同一 solver 实例支持并发调用或重入。
+/// With one effective worker, equation callbacks execute on the caller thread
+/// and observe its TLS. Multiple workers keep pool-thread execution. This does
+/// not make one solver instance concurrently callable or reentrant.
 class KINSOLInstance {
 public:
   /// 中文：RecoverableFailure 仅表示当前 IDA 试探点不可解；FatalFailure 表示
@@ -122,12 +134,42 @@ public:
   /// parameters for KINSOL.
   bool initialize();
 
+  /// 中文：实例可请求有界复用索引几何；调用方须认证访问映射只依赖方程索引，且直到销毁保持不变，IDA 使用已验证 epoch 布局。
+  ///       只缓存几何及固定回调/seed-buffer 绑定，不缓存数值或求解决策；新注册使计划失效，seed 存储属于固定 chunk。
+  ///       纯度未知或预算不足保留普通路径，限额只能降低，并须在注册完成后调用。
+  /// Request bounded reuse of index geometry for this instance. The caller
+  /// must certify that access maps are pure functions of equation indices and
+  /// remain fixed until destruction (IDA uses its validated epoch layout).
+  /// Only index geometry and fixed callback/seed-buffer bindings are cached,
+  /// never numerical values or solver decisions. New registration invalidates
+  /// the plan; bound seed storage belongs to this instance's fixed chunks.
+  /// Unknown access purity uses the ordinary path. Limits may only decrease;
+  /// insufficient budget leaves that path available. Call after registration.
+  bool requestImmutableAccessLayout(uint64_t workLimit = 1000000,
+                                    uint64_t storageLimit = 16000000);
+
+  /// 中文：内部可选契约要求活动 IDA owner 认证原标量配对及完整纯多项式 support。
+  ///       累计预算由 owner 拥有且必须长于实例生命周期；initialize() 再核对实际访问列，新的注册使认证失效。
+  /// Internal optional contract: original scalar pairing and complete pure
+  /// polynomial supports, certified by the active IDA owner. The cumulative
+  /// budget belongs to that owner and must outlive this instance. Actual access
+  /// columns are checked again at initialize(). Registration invalidates it.
+  bool requestScalarBlockPlan(std::vector<ScalarBlockPlan::Row> rows,
+                             ScalarBlockPlan::Budget &budget);
+  bool requestScalarBlockPlan(std::vector<ScalarBlockPlan::Row> rows,
+                             std::vector<TimedResidualFunction> explicitValues,
+                             ScalarBlockPlan::Budget &budget);
+
   bool solve();
 
   bool solve(realtype time);
 
   bool solve(realtype time, bool enableLineSearch);
 
+  /// 中文：外层 IDA 事务负责回滚，失败回调的 trial 值先保留给 condition 检查；独立 solve() 则在返回 false 前恢复注册未知量。
+  /// The enclosing IDA transaction owns rollback: failed callback trial values
+  /// remain available for its condition inspection. Standalone solve() rolls
+  /// back registered unknowns before returning false.
   SolveStatus solveWithStatus(realtype time);
 
   void setFunctionNormTolerance(realtype tolerance);
@@ -148,6 +190,14 @@ public:
   /// factorization for Schur complements, condition certificates, and
   /// multiple sensitivity right-hand sides.
   bool factorizeCurrentJacobian(realtype time);
+  bool bindC2KernelV1(const MarcoC2KernelV1 &descriptor);
+  bool hasC2KernelV1() const { return c2Kernel != nullptr; }
+  bool certifyC2KernelPoint(realtype time,
+      const std::vector<uint64_t> &rows, const std::vector<uint64_t> &columns,
+      SparseNonlinearSystem::ConditionEstimate &chart,
+      SparseNonlinearSystem::ConditionEstimate &closure);
+  SparseNonlinearSystem::FactorizationStatus
+  factorizeCurrentJacobianWithStatus(realtype time);
 
   bool solveCurrentJacobian(const std::vector<double> &rhs,
                             std::vector<double> &solution);
@@ -164,6 +214,19 @@ public:
   double getScalarVariableNominal(uint64_t scalarIndex) const;
 
   uint64_t getLastNonlinearIterations() const;
+  uint64_t getScalarBlockAcceptedCalls() const { return scalarBlockAccepted; }
+  uint64_t getScalarBlockDeclinedCalls() const { return scalarBlockDeclined; }
+
+  SparseNonlinearSystem::ResidualObservation getLastResidualObservation() const {
+    return nonlinearSystem ? nonlinearSystem->getLastResidualObservation()
+                           : SparseNonlinearSystem::ResidualObservation{};
+  }
+
+  void printInitializationScaling() const;
+
+  uint64_t getStatisticsId() const {
+    return nonlinearSystem ? nonlinearSystem->getStatistics().id : 0;
+  }
 
   uint64_t getExplicitNominalScalars() const {
     return explicitNominalScalars;
@@ -186,6 +249,33 @@ public:
                             N_Vector tempv1, N_Vector tempv2);
 
 private:
+  friend class marco::runtime::sundials::ida::IDAInstance;
+
+  // 中文：只有活动 IDA owner 可在同一调用作用域内检查本 epoch 的成功点；认证纯标量回调不能修改参数、外层输入或 basis。
+  //       该检查是既有完整 post-solve 健康检查，不是任意模型回调；回执不能跨 trial、失败求解、嵌套求解或函数返回存活。
+  // Only the active IDA owner may inspect this epoch's successful point in
+  // the same lexical invocation. Its certified pure scalar callbacks cannot
+  // modify parameters, outer inputs or the basis. The inspection is the
+  // existing full post-solve health check, never an arbitrary model callback.
+  // No receipt survives a trial, a failed solve, nested solve or this return.
+  SolveStatus solveAndCheck(realtype time,
+                           const std::function<void()> &inspection);
+  struct SuccessfulPoint {
+    realtype time;
+    const std::vector<double> &variables;
+    const std::vector<double> &residuals;
+  };
+  const SuccessfulPoint *successfulPoint{nullptr};
+
+  SolveStatus solveImpl(realtype time, bool rollbackOnFailure);
+  template <bool Generated>
+  SolveStatus solveBody(realtype time, bool rollbackOnFailure);
+  using SolveEntry = SolveStatus (KINSOLInstance::*)(realtype, bool);
+  SolveEntry solveEntry = &KINSOLInstance::solveBody<false>;
+
+  void invalidateAccessLayout();
+  bool prepareScalarBlockSolver();
+
   [[nodiscard]] uint64_t getNumOfArrayVariables() const;
 
   [[nodiscard]] uint64_t getNumOfScalarVariables() const;
@@ -221,7 +311,8 @@ private:
       EquationsParallelIterationKind kind,
       std::function<void(Equation equation,
                          const std::vector<int64_t> &equationIndices,
-                         const JacobianSeedsMap &jacobianSeedsMap)>
+                         const JacobianSeedsMap &jacobianSeedsMap,
+                         uint64_t scalarEquationIndex)>
           processFn);
 
   void getVariableBeginIndices(Variable variable,
@@ -250,6 +341,42 @@ private:
 private:
   // Whether the instance has been inizialized or not.
   bool initialized{false};
+
+  struct ImmutableAccessLayout {
+    struct VariableEntry {
+      Variable variable;
+      std::vector<uint64_t> indices;
+      uint64_t offset;
+    };
+    struct RowEntry {
+      size_t chunk;
+      std::vector<int64_t> indices;
+      uint64_t offset;
+    };
+    struct JacobianEntry {
+      sunindextype column;
+      JacobianFunction callback;
+      TimedJacobianFunction timedCallback;
+      const uint64_t *seeds;
+    };
+    std::vector<std::vector<JacobianColumn>> columns;
+    std::vector<std::vector<JacobianEntry>> evaluations;
+    std::vector<VariableEntry> variables;
+    std::vector<RowEntry> rows;
+  };
+  bool immutableAccessLayoutRequested{false};
+  uint64_t layoutWorkLimit{0}, layoutStorageLimit{0};
+  std::unique_ptr<ImmutableAccessLayout> accessLayout;
+  std::vector<ScalarBlockPlan::Row> scalarBlockRows;
+  std::vector<TimedResidualFunction> scalarExplicitValues;
+  std::unique_ptr<const ScalarBlockPlan> scalarBlockPlan;
+  ScalarBlockPlan::Budget *scalarBlockBudget{nullptr};
+  std::unique_ptr<ScalarBlockSolver> scalarBlockSolver;
+  bool scalarBlockPrepared{false}, lastSolveWasBlocked{false};
+  uint64_t scalarBlockIterations{0}, scalarBlockAccepted{0}, scalarBlockDeclined{0};
+  std::vector<double> scalarBlockValues;
+  struct C2KernelState;
+  std::unique_ptr<C2KernelState> c2Kernel;
 
   // Model size.
   uint64_t scalarVariablesNumber{0};
@@ -324,6 +451,7 @@ private:
   /// English: The shared kernel owns SUNDIALS vectors, KLU, and scaling; this
   /// facade retains MARCO array layout, callbacks, and sparse-column metadata.
   std::unique_ptr<SparseNonlinearSystem> nonlinearSystem;
+  std::atomic<uint64_t> scalarResidualCalls{0}, scalarJacobianCalls{0};
 
   std::vector<VariableGetter> variableGetters;
   std::vector<VariableSetter> variableSetters;

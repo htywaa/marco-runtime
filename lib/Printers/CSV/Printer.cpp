@@ -170,6 +170,9 @@ std::unique_ptr<cli::Category> CSVPrinter::getCLIOptions() {
 #endif // CLI_ENABLE
 
 void CSVPrinter::simulationBegin() {
+  if (printOptions().noOutput) {
+    return;
+  }
   openResultFile();
 
   SIMULATION_PROFILER_PRINTING_START
@@ -183,6 +186,9 @@ void CSVPrinter::simulationBegin() {
 }
 
 void CSVPrinter::printValues() {
+  if (printOptions().noOutput) {
+    return;
+  }
   getBuffer().getActiveBuffer()[0] = getTime();
 
   for (int64_t var : getSimulation()->variablesPrintOrder) {
@@ -225,6 +231,9 @@ void CSVPrinter::printValues() {
 }
 
 void CSVPrinter::simulationEnd() {
+  if (printOptions().noOutput) {
+    return;
+  }
   getBuffer().flush();
 
   if (resultFile.is_open()) {

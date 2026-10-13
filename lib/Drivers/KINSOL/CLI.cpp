@@ -11,8 +11,11 @@ std::string CommandLineOptions::getTitle() const { return "KINSOL"; }
 
 void CommandLineOptions::printCommandLineOptions(std::ostream &os) const {
   // clang-format off
-  os << "  --kinsol-relative-tolerance=<value>     Set the relative tolerance. Defaults to " << getOptions().relativeTolerance << "." << std::endl;
-  os << "  --kinsol-absolute-tolerance=<value>     Set the absolute tolerance. Defaults to " << getOptions().absoluteTolerance << "." << std::endl;
+  os << "  --kinsol-function-norm-tolerance=<value> Set the scaled residual norm stopping tolerance. Defaults to " << getOptions().fnormtol << "." << std::endl;
+  os << "  --kinsol-scaled-step-tolerance=<value>   Set the scaled Newton step stopping tolerance. Defaults to " << getOptions().scsteptol << "." << std::endl;
+  os << "  --kinsol-max-newton-step=<value>         Set the maximum scaled Newton step; 0 uses the runtime's system-size default. Defaults to " << getOptions().maxNewtonStep << "." << std::endl;
+  os << "  --kinsol-relative-tolerance=<value>     Compatibility alias for --kinsol-scaled-step-tolerance (not an ODE error tolerance)." << std::endl;
+  os << "  --kinsol-absolute-tolerance=<value>     Compatibility alias for --kinsol-function-norm-tolerance." << std::endl;
   os << "  --kinsol-equations-chunks-factor=<value> Set the factor which, once multiplied by the threads count, determines the number of equation chunks. Defaults to " << getOptions().equationsChunksFactor << "." << std::endl;
 
   os << "  --kinsol-max-steps=<value>              Set the maximum number of steps to be taken by the solver in its attempt to reach the next output time. Defaults to " << getOptions().maxSteps << "." << std::endl;
@@ -39,6 +42,21 @@ void CommandLineOptions::parseCommandLineOptions(
   // clang-format off
   options("kinsol-relative-tolerance", getOptions().relativeTolerance) >> getOptions().relativeTolerance;
   options("kinsol-absolute-tolerance", getOptions().absoluteTolerance) >> getOptions().absoluteTolerance;
+  // 中文：旧 relative/absolute 参数映射到局部停止条件；显式 KINSOL 名称随后覆盖，默认值保持原样。
+  // English: Legacy relative/absolute options map to local stopping criteria; explicit KINSOL
+  // names override them later while preserving defaults.
+  if (options("kinsol-relative-tolerance")) {
+    getOptions().scsteptol = getOptions().relativeTolerance;
+  }
+  if (options("kinsol-absolute-tolerance")) {
+    getOptions().fnormtol = getOptions().absoluteTolerance;
+  }
+  // 中文：明确的 KINSOL 参数名优先于兼容别名；两种拼写均未提供时保持求解器既有默认值。
+  // Explicit KINSOL names take precedence over compatibility aliases. Keep
+  // the solver's existing defaults when neither spelling is supplied.
+  options("kinsol-function-norm-tolerance", getOptions().fnormtol) >> getOptions().fnormtol;
+  options("kinsol-scaled-step-tolerance", getOptions().scsteptol) >> getOptions().scsteptol;
+  options("kinsol-max-newton-step", getOptions().maxNewtonStep) >> getOptions().maxNewtonStep;
   options("kinsol-equations-chunks-factor") >> getOptions().equationsChunksFactor;
   options("kinsol-max-steps", getOptions().maxSteps) >> getOptions().maxSteps;
   options("kinsol-initial-step-size", getOptions().initialStepSize) >> getOptions().initialStepSize;

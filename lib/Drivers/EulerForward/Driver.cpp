@@ -5,6 +5,8 @@
 #include "marco/Runtime/Simulation/Runtime.h"
 #include "marco/Runtime/Solvers/EulerForward/Options.h"
 #include "marco/Runtime/Solvers/EulerForward/Profiler.h"
+#include "../SimulationTime.h"
+#include <cmath>
 #include <iostream>
 
 namespace marco::runtime {
@@ -21,16 +23,32 @@ int EulerForward::run() {
     std::cerr << "[Euler Forward] Starting simulation" << std::endl;
   }
 
-  double time;
+  const double startTime = getTime();
+  const double endTime = simulation::getOptions().endTime;
+  const double requestedStep = eulerforward::getOptions().timeStep;
+  if (!std::isfinite(startTime) || !std::isfinite(endTime) || endTime < startTime ||
+      !std::isfinite(requestedStep) || requestedStep <= 0) {
+    std::cerr << "[Euler Forward] Invalid simulation interval or time step.\n";
+    return EXIT_FAILURE;
+  }
 
-  do {
+  internal::SimulationTime clock(startTime, endTime);
+  while (clock.hasNext()) {
+    // 中文：非整步终点需要执行最后一个较短步，不能提前退出或越界。
+    // English: Execute the shorter final step instead of stopping early or
+    // advancing beyond the requested endpoint.
+    const double timeStep = clock.clipStep(requestedStep);
+    if (!clock.canAdvance(timeStep)) {
+      std::cerr << "[Euler Forward] Time step cannot advance simulation time.\n";
+      return EXIT_FAILURE;
+    }
     // Compute the next values of the state variables.
     if (marco::runtime::simulation::getOptions().debug) {
       std::cerr << "[Euler Forward] Updating state variables" << std::endl;
     }
 
     EULER_FORWARD_PROFILER_STATEVAR_START
-    updateStateVariables(eulerforward::getOptions().timeStep);
+    updateStateVariables(timeStep);
     EULER_FORWARD_PROFILER_STATEVAR_STOP
 
     // Move to the next step.
@@ -40,8 +58,7 @@ int EulerForward::run() {
     }
 
     EULER_FORWARD_PROFILER_NONSTATEVAR_START
-    time = getTime() + eulerforward::getOptions().timeStep;
-    setTime(time);
+    setTime(clock.acceptStep(timeStep));
 
     updateNonStateVariables();
     EULER_FORWARD_PROFILER_NONSTATEVAR_STOP
@@ -52,8 +69,7 @@ int EulerForward::run() {
 
     // Print the values.
     getSimulation()->getPrinter()->printValues();
-  } while (std::abs(simulation::getOptions().endTime - time) >=
-           eulerforward::getOptions().timeStep);
+  }
 
   if (marco::runtime::simulation::getOptions().debug) {
     std::cerr << "[Euler Forward] Simulation finished" << std::endl;
